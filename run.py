@@ -58,6 +58,24 @@ from queue import Queue
 import queue  # for Empty exception
 from queue import Queue as ThreadQueue
 
+# FastAPI for text input via API
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+
+
+app = FastAPI()
+# グローバルテキストキュー
+text_queue: Queue[str] = Queue()
+
+class TextRequest(BaseModel):
+    text: str
+
+@app.post("/talk")
+async def talk_text(request: TextRequest):
+    text_queue.put(request.text)
+    return {"status": "queued", "text": request.text}
+
 import requests
 import numpy as np
 import scipy.io as scio
@@ -501,8 +519,7 @@ def main() -> None:
     pose_style = args.pose_style
     no_blink = args.no_blink
 
-    # テキストキューと紐付くプロデューサスレッドを起動
-    text_queue: Queue[str] = Queue()
+    # グローバルテキストキューを使ってProducerスレッドを起動
     text_thr = threading.Thread(
         target=text_producer_thread,
         args=(text_queue, q, img_path, device, pose_style, no_blink, args.style_id),
@@ -527,33 +544,8 @@ def main() -> None:
         daemon=True
     )
     cons_thr.start()
-
-    # 標準入力から複数行テキストを空行区切り or タイムアウトでバッファ集約
-    buffer_lines: List[str] = []
-    timeout = 0.1  # タイムアウト秒数
-    while True:
-        # stdin が読み込めるかタイムアウト付きで待つ
-        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-        if rlist:
-            line = sys.stdin.readline()
-            if not line:
-                continue
-            line = line.rstrip("\n")
-            if line == "":
-                if buffer_lines:
-                    text = ' '.join(buffer_lines)
-                    text_queue.put(text)
-                    buffer_lines = []
-            else:
-                buffer_lines.append(line)
-        else:
-            # タイムアウトかつバッファがある場合は強制フラッシュ
-            if buffer_lines:
-                text = ' '.join(buffer_lines)
-                text_queue.put(text)
-                buffer_lines = []
-
-# 無限ループなので終了判定なし
+    # 標準入力ループを廃止し、API経由でテキスト受付
+    return
 
 
 # --- Ensure child processes inherit stdout by using 'fork' start method ---
@@ -566,3 +558,4 @@ except RuntimeError:
 
 if __name__ == "__main__":
     main()
+    uvicorn.run(app, host="0.0.0.0", port=34512)
