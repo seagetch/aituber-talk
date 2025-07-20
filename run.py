@@ -28,7 +28,7 @@ import threading
 import logging
 import select
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from multiprocessing import Queue as MPQueue
 
 import logging
@@ -70,10 +70,12 @@ text_queue: Queue[str] = Queue()
 
 class TextRequest(BaseModel):
     text: str
+    style_id: Optional[int] = None
 
 @app.post("/talk")
 async def talk_text(request: TextRequest):
-    text_queue.put(request.text)
+    # リクエスト毎の style_id をキューに含める
+    text_queue.put((request.text, request.style_id))
     return {"status": "queued", "text": request.text}
 
 import requests
@@ -469,14 +471,25 @@ def text_producer_thread(
     tp_logger.handlers.clear()
     tp_logger.addHandler(QueueHandler(_log_queue))
     tp_logger.propagate = False
+    # 現在の style_id は起動時のデフォルト
+    current_style_id = style_id
     while True:
         try:
-            text = text_q.get()
-            tp_logger.info("[TextProducer] received text: %r", text)
+            item = text_q.get()
+            # テキスト and optional style_id タプルを unpack
+            if isinstance(item, tuple):
+                text, new_style_id = item
+            else:
+                text, new_style_id = item, None
+            # style_id が指定されていれば更新
+            if new_style_id is not None:
+                tp_logger.info("[TextProducer] style_id updated: %d -> %d", current_style_id, new_style_id)
+                current_style_id = new_style_id
+            tp_logger.info("[TextProducer] received text: %r with style_id=%d", text, current_style_id)
             sentences = split_sentences(text)
             for sent in sentences:
                 tp_logger.info("[TextProducer] processing sentence: %r", sent)
-                wav = tts_generate(sent, style_id)
+                wav = tts_generate(sent, current_style_id)
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
                     tf.write(wav)
                     tf.flush()
