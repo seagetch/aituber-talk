@@ -26,9 +26,37 @@ import math
 import signal
 import threading
 import logging
+import select
 from pathlib import Path
 from typing import Tuple, List
-from multiprocessing import Process, Queue as MPQueue
+from multiprocessing import Queue as MPQueue
+
+import logging
+from logging.handlers import QueueHandler, QueueListener
+from multiprocessing import Queue as MPQueue
+
+# --- set up parent logging handler ---
+_log_queue: MPQueue = MPQueue()
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(
+    logging.Formatter(
+        fmt="[%(processName)s %(levelname)s] %(asctime)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+# clear any existing handlers
+for _h in _root_logger.handlers[:]:
+    _root_logger.removeHandler(_h)
+_root_logger.addHandler(_console_handler)
+# start listener that will take log records from queue and handle them
+_listener = QueueListener(_log_queue, _console_handler)
+_listener.start()
+
+from queue import Queue
+import queue  # for Empty exception
+from queue import Queue as ThreadQueue
 
 import requests
 import numpy as np
@@ -267,54 +295,114 @@ def producer_proc(
     pose_style: int,
     no_blink: bool
 ) -> None:
+    # child process logging via queue
+    proc_logger = logging.getLogger("run.producer")
+    proc_logger.setLevel(logging.INFO)
+    proc_logger.handlers.clear()
+    proc_logger.addHandler(QueueHandler(_log_queue))
+    proc_logger.propagate = False
+    proc_logger.info("[Producer] process started")
     for i, sent in enumerate(sents, 1):
         try:
-            logger.info("[Producer] %d/%d TTS ...", i, len(sents))
+            proc_logger.info("[Producer] %d/%d TTS '%s'...", i, len(sents), sent)
             wav = tts_generate(sent, style_id)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
                 tf.write(wav)
                 tf.flush()
-                logger.info("   SadTalker ...")
+                proc_logger.info("   SadTalker ...")
                 coeff = sadtalker_coeff(
                     img_path, Path(tf.name),
                     device, pose_style, no_blink
                 )
             q.put((wav, coeff))
         except Exception as e:
-            logger.error("Producer error: %s", e, exc_info=True)
+            proc_logger.error("Producer error: %s", e, exc_info=True)
     q.put((None, None))
-    logger.info("[Producer] done.")
+    proc_logger.info("[Producer] done.")
 
 # ---------------------------------------------------------------------------
 # 5) Consumer (thread)
 # ---------------------------------------------------------------------------
-def consumer_thread(q: MPQueue, sock: SimpleUDPClient) -> None:
-    import pygame
-    import pygame.mixer
-    pygame.init()
-    pygame.mixer.init()
+# ---------------------------------------------------------------------------
+# idle-motion generator thread
+# ---------------------------------------------------------------------------
+def idle_generator_thread(
+    idle_q: ThreadQueue,
+    motion_q: MPQueue,
+    img_path: Path,
+    device: str,
+    pose_style: int,
+    no_blink: bool
+) -> None:
+    """先読みでアイドルモーションを生成してキューに詰める"""
+    import tempfile
+    import wave
+    while True:
+        # テキスト処理中は待機モーション生成を待機
+        while not motion_q.empty():
+            time.sleep(0.1)
+        # 3秒の無音WAVを作成
+        duration = 3.0
+        sample_rate = 16000
+        n_samples = int(duration * sample_rate)
+        wav_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        with wave.open(wav_file, 'w') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(b"\x00\x00" * n_samples)
+        coeff_idle = sadtalker_coeff(img_path, Path(wav_file), device, pose_style, no_blink)
+        os.unlink(wav_file)
+        if coeff_idle.ndim == 1:
+            coeff_idle = coeff_idle.reshape(1, -1)
+        # 2つ分までキューに保持
+        idle_q.put((coeff_idle, duration))
+
+
+def consumer_thread(
+    q: MPQueue,
+    idle_q: ThreadQueue,
+    sock: SimpleUDPClient,
+    img_path: Path,
+    device: str,
+    pose_style: int,
+    no_blink: bool
+) -> None:
+    import pygame, pygame.mixer
+    pygame.init(); pygame.mixer.init()
     try:
         while True:
-            wav, coeff = q.get()
-            if wav is None:
-                break
-            if coeff is None or coeff.size == 0:
-                logger.warning("Empty coeff received – skipping segment")
+            # ノンブロッキングで音声モーションを取得
+            try:
+                wav, coeff = q.get_nowait()
+                is_speech = True
+            except queue.Empty:
+                is_speech = False
+            if not is_speech:
+                # アイドルバッファから取得
+                coeff_idle, duration = idle_q.get()
+                frames = coeff_idle.shape[0]
+                dt = duration / frames
+                for idx in range(frames):
+                    # フレーム送信前に音声モーションが来ていれば即時切替
+                    if not q.empty():
+                        break
+                    send_frame(sock, coeff_idle[idx])
+                    time.sleep(dt)
                 continue
 
+            # Speech segment processing
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                tf.write(wav)
-                wav_path = tf.name
-            sound  = pygame.mixer.Sound(wav_path)
+                tf.write(wav); wav_path = tf.name
+            sound = pygame.mixer.Sound(wav_path)
             length = sound.get_length()
-            frames = len(coeff)
-            if frames == 0:
-                logger.warning("coeff length 0 – skipping OSC send")
-                sound.play()
-                time.sleep(length)
-                os.unlink(wav_path)
-                continue
-
+            if coeff is None or coeff.size == 0:
+                logger.warning("Empty coeff received – regenerating via SadTalker model")
+                coeff = sadtalker_coeff(img_path, Path(wav_path),
+                                        device, pose_style, no_blink)
+            if coeff.ndim == 1:
+                coeff = coeff.reshape(1, -1)
+            frames = coeff.shape[0]
             dt = length / frames
             ch = sound.play()
             start = time.perf_counter()
@@ -323,74 +411,158 @@ def consumer_thread(q: MPQueue, sock: SimpleUDPClient) -> None:
             while ch.get_busy() and idx < frames:
                 now = time.perf_counter() - start
                 while idx < frames and now >= next_t:
-                    send_frame(sock, coeff[idx])
-                    idx += 1
-                    next_t += dt
+                    send_frame(sock, coeff[idx]); idx += 1; next_t += dt
                 time.sleep(0.001)
-            # 余ったフレーム送信
             while idx < frames:
-                send_frame(sock, coeff[idx])
-                idx += 1
+                send_frame(sock, coeff[idx]); idx += 1
             os.unlink(wav_path)
             logger.info("[Consumer] segment done (%.2fs)", length)
     finally:
-        pygame.mixer.quit()
-        pygame.quit()
+        pygame.mixer.quit(); pygame.quit()
         logger.info("[Consumer] finished.")
 
 # ---------------------------------------------------------------------------
 # 6) main
 # ---------------------------------------------------------------------------
+
+# デフォルト設定
+DEFAULT_DEVICE = "cpu"
+DEFAULT_POSE_STYLE = 0
+DEFAULT_NO_BLINK = False
+
+
+
+
+# ---------------------------------------------------------------------------
+# text producer thread
+# ---------------------------------------------------------------------------
+def text_producer_thread(
+    text_q: Queue,
+    motion_q: MPQueue,
+    img_path: Path,
+    device: str,
+    pose_style: int,
+    no_blink: bool,
+    style_id: int
+) -> None:
+    """標準入力テキストを受け取り、音声とモーションを生成して motion_q に渡す"""
+    tp_logger = logging.getLogger("run.text_producer")
+    tp_logger.setLevel(logging.INFO)
+    tp_logger.handlers.clear()
+    tp_logger.addHandler(QueueHandler(_log_queue))
+    tp_logger.propagate = False
+    while True:
+        try:
+            text = text_q.get()
+            tp_logger.info("[TextProducer] received text: %r", text)
+            sentences = split_sentences(text)
+            for sent in sentences:
+                tp_logger.info("[TextProducer] processing sentence: %r", sent)
+                wav = tts_generate(sent, style_id)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
+                    tf.write(wav)
+                    tf.flush()
+                    coeff = sadtalker_coeff(
+                        img_path,
+                        Path(tf.name),
+                        device,
+                        pose_style,
+                        no_blink
+                    )
+                motion_q.put((wav, coeff))
+        except Exception as e:
+            tp_logger.error("[TextProducer] error: %s", e, exc_info=True)
+            continue
+
+
+# ---------------------------------------------------------------------------
+# stdin-driven producer main loop
+# ---------------------------------------------------------------------------
 def main() -> None:
+    # CLI引数パース
     pa = argparse.ArgumentParser()
-    pa.add_argument("--text", required=True)
     pa.add_argument("--style_id", type=int, default=DEFAULT_STYLE_ID)
     pa.add_argument("--image", default=str(DEFAULT_IMAGE_PATH))
-    pa.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    pa.add_argument("--pose_style", type=int, default=0)
-    pa.add_argument(
-        "--no_blink",
-        action="store_true",
-        help="瞬きを完全に無効化する（ただしベースラインは維持）"
-    )
+    pa.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    pa.add_argument("--pose_style", type=int, default=DEFAULT_POSE_STYLE)
+    pa.add_argument("--no_blink", action="store_true",
+                    help="瞬きを完全に無効化する（ただしベースラインは維持）")
     pa.add_argument("--osc_host", default="127.0.0.1")
     pa.add_argument("--osc_port", type=int, default=39540)
     args = pa.parse_args()
 
+    # キューとOSCクライアントを作成
+    q: MPQueue[Task] = MPQueue(maxsize=10)
+    sock = SimpleUDPClient(args.osc_host, args.osc_port)
     img_path = Path(args.image).expanduser().resolve()
     if not img_path.exists():
         sys.exit("❌ image not found")
+    device = args.device
+    pose_style = args.pose_style
+    no_blink = args.no_blink
 
-    sentences = split_sentences(args.text)
-    if not sentences:
-        sys.exit("❌ empty text")
-
-    q: MPQueue[Task] = MPQueue(maxsize=10)
-    sock = SimpleUDPClient(args.osc_host, args.osc_port)
-
-    prod = Process(
-        target=producer_proc,
-        args=(
-            sentences, img_path, q,
-            args.style_id, args.device,
-            args.pose_style, args.no_blink
-        ),
+    # テキストキューと紐付くプロデューサスレッドを起動
+    text_queue: Queue[str] = Queue()
+    text_thr = threading.Thread(
+        target=text_producer_thread,
+        args=(text_queue, q, img_path, device, pose_style, no_blink, args.style_id),
         daemon=True
     )
-    cons = threading.Thread(
+    text_thr.start()
+
+    # アイドルモーションバッファキュー
+    idle_queue: ThreadQueue = ThreadQueue(maxsize=2)
+    # アイドル生成スレッド開始
+    idle_gen_thr = threading.Thread(
+        target=idle_generator_thread,
+        args=(idle_queue, q, img_path, device, pose_style, no_blink),
+        daemon=True
+    )
+    idle_gen_thr.start()
+
+    # コンシューマスレッド起動（アイドルキューを渡す）
+    cons_thr = threading.Thread(
         target=consumer_thread,
-        args=(q, sock),
+        args=(q, idle_queue, sock, img_path, device, pose_style, no_blink),
         daemon=True
     )
+    cons_thr.start()
 
-    cons.start()
-    prod.start()
-    try:
-        prod.join()
-        cons.join()
-    except KeyboardInterrupt:
-        logger.info("Interrupted")
-    logger.info("✅ All done.")
+    # 標準入力から複数行テキストを空行区切り or タイムアウトでバッファ集約
+    buffer_lines: List[str] = []
+    timeout = 0.1  # タイムアウト秒数
+    while True:
+        # stdin が読み込めるかタイムアウト付きで待つ
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            line = sys.stdin.readline()
+            if not line:
+                continue
+            line = line.rstrip("\n")
+            if line == "":
+                if buffer_lines:
+                    text = ' '.join(buffer_lines)
+                    text_queue.put(text)
+                    buffer_lines = []
+            else:
+                buffer_lines.append(line)
+        else:
+            # タイムアウトかつバッファがある場合は強制フラッシュ
+            if buffer_lines:
+                text = ' '.join(buffer_lines)
+                text_queue.put(text)
+                buffer_lines = []
+
+# 無限ループなので終了判定なし
+
+
+# --- Ensure child processes inherit stdout by using 'fork' start method ---
+import multiprocessing
+try:
+    multiprocessing.set_start_method('fork')
+except RuntimeError:
+    # Start method may have been set already
+    pass
 
 if __name__ == "__main__":
     main()
