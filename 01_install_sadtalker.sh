@@ -16,7 +16,7 @@ conda activate sadtalker
 conda install -y ffmpeg
 pip3 install -U --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 
-pip install -r ../requirements.txt
+pip install -r ../requirements-sadtalker.txt
 conda install -y scipy
 pip install mat73 h5py --upgrade
 #pip install dlib==19.24.0 
