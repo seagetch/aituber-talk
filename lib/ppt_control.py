@@ -9,13 +9,6 @@ try:
 except ImportError:
     pythoncom = None
 
-# macOS 用 ScriptingBridge 用
-try:
-    from Foundation import NSURL
-    from ScriptingBridge import SBApplication
-except ImportError:
-    SBApplication = None
-
 
 class _WindowsPowerPointController:
     """
@@ -60,38 +53,73 @@ class _WindowsPowerPointController:
 
 class _MacPowerPointController:
     """
-    macOS 環境で PowerPoint を ScriptingBridge 経由で制御する実装
+    macOS 環境で PowerPoint を AppleScript (osascript) で制御する実装
     """
-    BUNDLE_ID = "com.microsoft.Powerpoint"
-
     def __init__(self):
-        # 既存プロセスへアタッチ
-        self.ppt = SBApplication.applicationWithBundleIdentifier_(self.BUNDLE_ID)
+        self.ppt_path = None
 
     def open_file(self, ppt_path: str):
         """
-        指定ファイルを既存 PowerPoint プロセスで開く
+        指定ファイルをAppleScript経由でPowerPointで開く
         """
-        url = NSURL.fileURLWithPath_(ppt_path)
-        self.presentation = self.ppt.open_(url)
+        import subprocess
+        import time
+        self.ppt_path = os.path.abspath(ppt_path)
+        script = f'''
+        tell application "Microsoft PowerPoint"
+            activate
+            open POSIX file "{self.ppt_path}"
+            delay 0.5
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", script])
         time.sleep(0.5)
 
     def start_slideshow(self):
         """
-        開いたファイルをスライドショーモードで表示
+        開いたファイルをスライドショーモードで表示（macOS/osascript使用）
         """
-        # AppleScript 辞書に合わせたメソッド
-        self.ppt.startSlideShow_(self.presentation)
+        import subprocess
+        import time
+        script = f'''
+        tell application "Microsoft PowerPoint"
+            activate
+            open POSIX file "{self.ppt_path}"
+            delay 0.5
+            set thePres to active presentation
+            set slideShowSettings to slide show settings of thePres
+            run slideShowSettings
+            delay 0.5
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", script])
         time.sleep(0.5)
-        # slideShowView を保持
-        self.show_view = self.presentation.slideShowView()
 
     def goto_slide(self, index: int):
-        """
-        スライドショーモード中に任意のスライド番号へジャンプ
-        index: 1 始まりのスライド番号
-        """
-        self.show_view.goToSlideIndex_(index)
+        import subprocess, time, textwrap
+        script = textwrap.dedent(f"""
+            tell application "Microsoft PowerPoint"
+                if (count of slide show windows) is 0 then return
+                tell slide show window 1
+                    tell its slide show view
+                        set curPos to current show position
+                        if curPos < {index} then
+                            repeat while curPos < {index}
+                                go to next slide
+                                set curPos to current show position
+                            end repeat
+                        else if curPos > {index} then
+                            repeat while curPos > {index}
+                                go to previous slide
+                                set curPos to current show position
+                            end repeat
+                        end if
+                    end tell
+                end tell
+            end tell
+        """)
+        subprocess.run(["osascript", "-e", script])
+        time.sleep(0.2)
 
 
 class PowerPointController:
@@ -110,8 +138,6 @@ class PowerPointController:
                 raise RuntimeError("pywin32 がインストールされていません。Windows での操作には pywin32 が必要です。")
             return _WindowsPowerPointController()
         elif system == "Darwin":
-            if SBApplication is None:
-                raise RuntimeError("pyobjc がインストールされていません。macOS での操作には pyobjc が必要です。")
             return _MacPowerPointController()
         else:
             raise RuntimeError(f"Unsupported OS: {system}")

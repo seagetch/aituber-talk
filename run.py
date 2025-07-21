@@ -68,15 +68,39 @@ app = FastAPI()
 # グローバルテキストキュー
 text_queue: Queue[str] = Queue()
 
+import uuid
+import asyncio
+
 class TextRequest(BaseModel):
     text: str
     style_id: Optional[int] = None
+    sync: Optional[bool] = False
+
+# 再生完了を管理する辞書
+playback_done_events = {}
+playback_done_lock = threading.Lock()
 
 @app.post("/talk")
 async def talk_text(request: TextRequest):
-    # リクエスト毎の style_id をキューに含める
-    text_queue.put((request.text, request.style_id))
-    return {"status": "queued", "text": request.text}
+    # 一意なIDを発行
+    req_id = str(uuid.uuid4())
+    # 再生完了通知用のEventを作成
+    event = threading.Event()
+    with playback_done_lock:
+        playback_done_events[req_id] = event
+    # text_queueにID付きでput
+    text_queue.put((request.text, request.style_id, req_id))
+    if request.sync:
+        # 再生完了まで待機（最大300秒タイムアウト）
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, event.wait, 300)
+        finally:
+            with playback_done_lock:
+                playback_done_events.pop(req_id, None)
+        return {"status": "done", "text": request.text}
+    else:
+        return {"status": "queued", "text": request.text}
 
 import requests
 import numpy as np
@@ -394,7 +418,12 @@ def consumer_thread(
         while True:
             # ノンブロッキングで音声モーションを取得
             try:
+                wav, coeff, req_id = q.get_nowait()
+                is_speech = True
+            except ValueError:
+                # 旧形式: (wav, coeff)
                 wav, coeff = q.get_nowait()
+                req_id = None
                 is_speech = True
             except queue.Empty:
                 is_speech = False
@@ -437,6 +466,18 @@ def consumer_thread(
                 send_frame(sock, coeff[idx]); idx += 1
             os.unlink(wav_path)
             logger.info("[Consumer] segment done (%.2fs)", length)
+            # 再生完了通知
+            if req_id is not None:
+                with playback_done_lock:
+                    count_key = req_id + "_count"
+                    if count_key in playback_done_events:
+                        playback_done_events[count_key] -= 1
+                        if playback_done_events[count_key] <= 0:
+                            # 全文再生完了
+                            event = playback_done_events.get(req_id)
+                            if event:
+                                event.set()
+                            playback_done_events.pop(count_key, None)
     finally:
         pygame.mixer.quit(); pygame.quit()
         logger.info("[Consumer] finished.")
@@ -465,28 +506,35 @@ def text_producer_thread(
     no_blink: bool,
     style_id: int
 ) -> None:
-    """標準入力テキストを受け取り、音声とモーションを生成して motion_q に渡す"""
+    """標準入力テキストを受け取り、音声とモーションを生成して motion_q に渡す
+    (APIリクエストのuuidを伝搬し、全文再生完了時に通知できるようにする)
+    """
     tp_logger = logging.getLogger("run.text_producer")
     tp_logger.setLevel(logging.INFO)
     tp_logger.handlers.clear()
     tp_logger.addHandler(QueueHandler(_log_queue))
     tp_logger.propagate = False
-    # 現在の style_id は起動時のデフォルト
     current_style_id = style_id
     while True:
         try:
             item = text_q.get()
-            # テキスト and optional style_id タプルを unpack
-            if isinstance(item, tuple):
+            # item: (text, style_id, req_id) or (text, style_id)
+            if isinstance(item, tuple) and len(item) == 3:
+                text, new_style_id, req_id = item
+            elif isinstance(item, tuple) and len(item) == 2:
                 text, new_style_id = item
+                req_id = None
             else:
-                text, new_style_id = item, None
-            # style_id が指定されていれば更新
+                text, new_style_id, req_id = item, None, None
             if new_style_id is not None:
                 tp_logger.info("[TextProducer] style_id updated: %d -> %d", current_style_id, new_style_id)
                 current_style_id = new_style_id
-            tp_logger.info("[TextProducer] received text: %r with style_id=%d", text, current_style_id)
+            tp_logger.info("[TextProducer] received text: %r with style_id=%d, req_id=%s", text, current_style_id, req_id)
             sentences = split_sentences(text)
+            # uuidごとに残り文数をカウント
+            if req_id is not None:
+                with playback_done_lock:
+                    playback_done_events[req_id + "_count"] = len(sentences)
             for sent in sentences:
                 tp_logger.info("[TextProducer] processing sentence: %r", sent)
                 wav = tts_generate(sent, current_style_id)
@@ -500,7 +548,8 @@ def text_producer_thread(
                         pose_style,
                         no_blink
                     )
-                motion_q.put((wav, coeff))
+                # motion_qにuuidを付与してput
+                motion_q.put((wav, coeff, req_id))
         except Exception as e:
             tp_logger.error("[TextProducer] error: %s", e, exc_info=True)
             continue
