@@ -642,7 +642,7 @@ def main() -> None:
     pa = argparse.ArgumentParser()
     pa.add_argument("--style_id", type=int, default=DEFAULT_STYLE_ID)
     pa.add_argument("--image", default=str(DEFAULT_IMAGE_PATH))
-    pa.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    pa.add_argument("--device", choices=["cpu", "cuda", "mps"], default=DEFAULT_DEVICE)
     pa.add_argument("--pose_style", type=int, default=DEFAULT_POSE_STYLE)
     pa.add_argument("--no_blink", action="store_true",
                     help="瞬きを完全に無効化する（ただしベースラインは維持）")
