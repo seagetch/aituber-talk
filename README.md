@@ -31,8 +31,9 @@ aituber-talkは、**テキストを入力するとAIアバターがその内容�
 
 ### 代表的な利用シーン
 
-- **テキストから自動で喋るアバター動画を生成**  
-  Web UIやAPI経由でテキストを入力→音声合成→リップシンク動画生成まで一括
+- **テキストから自動で喋るアバターのモーションを生成**  
+  Web UIやAPI経由でテキストを入力→音声合成→リップシンクモーション生成まで一括実行。
+  モーションを音声に合わせてVMCなどで外部プログラムに送信することにより、nijiexpose/live2d/VRMなどのモデルを動かすことができます。
 - **APIサーバーとしての利用**  
   run.pyを起動し、外部クライアントや自作スクリプトからHTTPリクエストでAIアバター生成APIを利用
 - **Web UIによるインタラクティブ操作**  
@@ -52,13 +53,16 @@ flowchart TD
     run_py[run.py]
     aivisspeech_dir[aivisspeech]
     sadtalker_dir[SadTalker]
-    nijigenerate[nijigenerate etc.]
-   
+    nijiexpose[nijiexpose etc.]
+    obs[OBS]
+
     user_web --> webui_py
     webui_py -->|HTTP| run_py
     run_py --> |HTTP| aivisspeech_dir
     run_py --> sadtalker_dir
-    run_py -->|VMC| nijigenerate
+    run_py -->|VMC| nijiexpose
+    nijiexpose -->|video| obs
+    run_py -->|audio| obs
 
     user_presenter --> present_and_talk_py
     present_and_talk_py --> pptx
@@ -72,9 +76,9 @@ flowchart TD
 
 ## 特徴
 
-- テキスト入力からAIアバターの発話・リップシンク動画を自動生成
+- テキスト入力からAIアバターの発話・リップシンクのモーション/BlendShapeを自動生成
 - aivisspeechによる高品質な音声合成（TTS）
-- SadTalkerによる高精度な顔アニメーション・リップシンク
+- SadTalkerによる高精度な顔アニメーション・リップシンクモーション生成
 - 独自の拡張機能やユーティリティ（`lib/`, `run.py`, `webui.py` など）
 - Web UI/REST API両対応
 - セットアップ用シェルスクリプトを同梱
