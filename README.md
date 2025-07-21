@@ -45,21 +45,27 @@ aituber-talkは、**テキストを入力するとAIアバターがその内容�
 ```mermaid
 flowchart TD
     user_web[WebUser]
-    user_api[APIClient]
-    webui_py[webui_py]
-    run_py[run_py]
+    user_presenter[Presenter - CLI]
+    webui_py[webui.py]
+    present_and_talk_py[present_and_talk.py]
+    pptx[lib.ppt_control]
+    run_py[run.py]
     aivisspeech_dir[aivisspeech]
     sadtalker_dir[SadTalker]
-    lib_dir[lib]
-
+    nijigenerate[nijigenerate etc.]
+   
     user_web --> webui_py
     webui_py -->|HTTP| run_py
-    user_api -->|HTTP| run_py
-    run_py --> aivisspeech_dir
+    run_py --> |HTTP| aivisspeech_dir
     run_py --> sadtalker_dir
-    run_py --> lib_dir
+    run_py -->|VMC| nijigenerate
+
+    user_presenter --> present_and_talk_py
+    present_and_talk_py --> pptx
+    present_and_talk_py -->|HTTP /talk| run_py
 
     %% run_py is the API server. It orchestrates aivisspeech (TTS) and SadTalker (avatar motion).
+    %% present_and_talk.py automates PowerPoint and calls run.py API for each slide.
 ```
 
 ---
@@ -177,10 +183,59 @@ flowchart TD
 - API仕様・エンドポイントはrun.pyの実装を参照してください。
 
 
+## プレゼン自動進行＋AI読み上げスクリプト（present_and_talk.py）
+
+### 概要
+
+`present_and_talk.py`は、PowerPointファイルとスクリプト（markdown形式）を指定することで、  
+PowerPointを自動でページ送りしつつ、各スライドの本文をAIアバター（run.pyの/talk API経由）で順次読み上げさせる自動プレゼン進行ツールです。
+
+- PowerPointを自動で開き、スライドショーを開始
+- 各スライドの本文をAPI経由でAI音声合成・リップシンク再生（sync=Trueで完了まで待機）
+- script.mdの内容に従い、スライドごとにページ送り＋読み上げを自動化
+
+### 使い方
+
+1. 事前にrun.py（APIサーバー）を起動しておく
+2. PowerPointファイル（.pptx）とスクリプト（markdown形式）を用意
+3. 下記コマンドで実行
+
+```bash
+python present_and_talk.py path/to/presentation.pptx path/to/script.md
+```
+
+#### オプション
+
+- `--style_id` : 話者のStyleID（省略可）
+- `--api_url` : run.pyのAPIエンドポイント（デフォルト: http://127.0.0.1:34512/talk）
+- `--wait` : ページ送り後の待機秒数（デフォルト: 1.0）
+
+#### script.mdのフォーマット例
+
+```markdown
+# スライド1 タイトル
+本文1
+
+# スライド2 タイトル
+本文2
+
+# スライド3
+本文3
+```
+
+### 注意事項
+
+- PowerPointの自動操作にはlib/ppt_control.pyが必要です（macOS/Windows両対応）。
+- run.pyサーバーが起動している必要があります。
+- スクリプトの各スライド本文が空の場合は読み上げをスキップします。
+
+---
+
 ## ディレクトリ構成
 
 - `run.py` : バックエンドAPIサーバースクリプト
 - `webui.py` : GradioベースWeb UI（run.pyのAPIを利用）
+- `present_and_talk.py` : PowerPoint自動進行＋AI読み上げスクリプト
 - `lib/` : 独自拡張・ユーティリティ
 - `SadTalker/` : SadTalker本体および関連ファイル
 - `aivisspeech-test/`, `sadtalker-test/` : テスト・サンプル用スクリプト
