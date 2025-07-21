@@ -60,12 +60,20 @@ class ImageViewer:
         self._update_display()
 
     def _update_display(self):
-        # Handle events and redraw
-        for event in pygame.event.get():
+        # Process only QUIT and VIDEORESIZE events; repost others
+        events = pygame.event.get()
+        others = []
+        for event in events:
             if event.type == pygame.QUIT:
                 pygame.quit()
             elif event.type == pygame.VIDEORESIZE:
                 self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+            else:
+                others.append(event)
+        # Repost unhandled events (e.g., MOUSEBUTTONDOWN)
+        for e in others:
+            pygame.event.post(e)
+
         if self.original:
             w, h = self.screen.get_size()
             sw, sh = self.original.get_size()
@@ -102,6 +110,20 @@ def main():
         time.sleep(args.wait)
 
     viewer = ImageViewer() if args.img else None
+    # --imgでウィンドウ表示時、クリックでプレゼン開始
+    if viewer:
+        print("画像ビューアをクリックするとプレゼンを開始します")
+        waiting_click = True
+        while waiting_click:
+            viewer._update_display()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif ev.type == pygame.MOUSEBUTTONDOWN:
+                    print("Clicked")
+                    waiting_click = False
+            time.sleep(0.01)
 
     # スライド処理関数（ワーカースレッドで実行）
     def slide_runner():
