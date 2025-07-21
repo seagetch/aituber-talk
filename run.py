@@ -28,7 +28,7 @@ import threading
 import logging
 import select
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Set
 from multiprocessing import Queue as MPQueue
 
 import logging
@@ -60,6 +60,9 @@ from queue import Queue as ThreadQueue
 
 # FastAPI for text input via API
 from fastapi import FastAPI
+from fastapi import HTTPException
+from typing import Optional
+import threading
 from pydantic import BaseModel
 import uvicorn
 
@@ -67,6 +70,12 @@ import uvicorn
 app = FastAPI()
 # グローバルテキストキュー
 text_queue: Queue[str] = Queue()
+# Globals for playback control
+motion_queue: Optional[MPQueue] = None
+idle_motion_queue: Optional[ThreadQueue] = None
+current_session_id: Optional[str] = None
+pause_event = threading.Event()
+stopped_sessions: Set[str] = set()
 
 import uuid
 import asyncio
@@ -91,16 +100,77 @@ async def talk_text(request: TextRequest):
     # text_queueにID付きでput
     text_queue.put((request.text, request.style_id, req_id))
     if request.sync:
-        # 再生完了まで待機（最大300秒タイムアウト）
-        loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, event.wait, 300)
-        finally:
+        # 同期再生の制御（完了・一時停止・停止を待機）
+        start_time = time.time()
+        timeout = 300
+        status = "timeout"
+        while True:
+            # 完了チェック
             with playback_done_lock:
-                playback_done_events.pop(req_id, None)
-        return {"status": "done", "text": request.text}
+                ev = playback_done_events.get(req_id)
+            if ev and ev.wait(timeout=0.1):
+                status = "completed"
+                break
+            # 一時停止チェック
+            if pause_event.is_set():
+                status = "paused"
+                break
+            # 停止チェック
+            if req_id in stopped_sessions:
+                status = "stopped"
+                break
+            # タイムアウトチェック
+            if time.time() - start_time > timeout:
+                status = "timeout"
+                break
+        with playback_done_lock:
+            playback_done_events.pop(req_id, None)
+        if status == "stopped":
+            stopped_sessions.discard(req_id)
+        return {"status": status, "text": request.text, "session": req_id}
     else:
-        return {"status": "queued", "text": request.text}
+        return {"status": "queued", "text": request.text, "session": req_id}
+
+# --- Playback control endpoints ---
+
+@app.post("/pause")
+async def pause_playback():
+    global pause_event, current_session_id
+    if current_session_id is None:
+        raise HTTPException(status_code=400, detail="No active session to pause")
+    pause_event.set()
+    return {"status": "paused", "session": current_session_id}
+
+@app.post("/resume")
+async def resume_playback():
+    global pause_event
+    if not pause_event.is_set():
+        raise HTTPException(status_code=400, detail="No paused session to resume")
+    pause_event.clear()
+    return {"status": "resumed", "session": current_session_id}
+
+@app.post("/stop")
+async def stop_playback():
+    global pause_event, current_session_id, motion_queue, idle_motion_queue
+    pause_event.clear()
+    if current_session_id is not None:
+        stopped_sessions.add(current_session_id)
+    if motion_queue is not None:
+        while not motion_queue.empty():
+            motion_queue.get()
+    if idle_motion_queue is not None:
+        while not idle_motion_queue.empty():
+            idle_motion_queue.get()
+    current_session_id = None
+    return {"status": "stopped"}
+
+@app.get("/status")
+async def status_playback():
+    return {
+        "session": current_session_id,
+        "paused": pause_event.is_set(),
+        "queued": motion_queue.qsize() if motion_queue else 0
+    }
 
 import requests
 import numpy as np
@@ -412,6 +482,7 @@ def consumer_thread(
     pose_style: int,
     no_blink: bool
 ) -> None:
+    global current_session_id
     import pygame, pygame.mixer
     pygame.init(); pygame.mixer.init()
     try:
@@ -436,11 +507,14 @@ def consumer_thread(
                     # フレーム送信前に音声モーションが来ていれば即時切替
                     if not q.empty():
                         break
+                    while pause_event.is_set():
+                        time.sleep(0.1)
                     send_frame(sock, coeff_idle[idx])
                     time.sleep(dt)
                 continue
 
             # Speech segment processing
+            current_session_id = req_id
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                 tf.write(wav); wav_path = tf.name
             sound = pygame.mixer.Sound(wav_path)
@@ -460,9 +534,13 @@ def consumer_thread(
             while ch.get_busy() and idx < frames:
                 now = time.perf_counter() - start
                 while idx < frames and now >= next_t:
+                    while pause_event.is_set():
+                        time.sleep(0.1)
                     send_frame(sock, coeff[idx]); idx += 1; next_t += dt
                 time.sleep(0.001)
             while idx < frames:
+                while pause_event.is_set():
+                    time.sleep(0.1)
                 send_frame(sock, coeff[idx]); idx += 1
             os.unlink(wav_path)
             logger.info("[Consumer] segment done (%.2fs)", length)
@@ -478,6 +556,7 @@ def consumer_thread(
                             if event:
                                 event.set()
                             playback_done_events.pop(count_key, None)
+            current_session_id = None
     finally:
         pygame.mixer.quit(); pygame.quit()
         logger.info("[Consumer] finished.")
@@ -573,6 +652,8 @@ def main() -> None:
 
     # キューとOSCクライアントを作成
     q: MPQueue[Task] = MPQueue(maxsize=10)
+    global motion_queue
+    motion_queue = q
     sock = SimpleUDPClient(args.osc_host, args.osc_port)
     img_path = Path(args.image).expanduser().resolve()
     if not img_path.exists():
@@ -591,6 +672,8 @@ def main() -> None:
 
     # アイドルモーションバッファキュー
     idle_queue: ThreadQueue = ThreadQueue(maxsize=2)
+    global idle_motion_queue
+    idle_motion_queue = idle_queue
     # アイドル生成スレッド開始
     idle_gen_thr = threading.Thread(
         target=idle_generator_thread,
