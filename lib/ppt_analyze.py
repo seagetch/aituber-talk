@@ -220,10 +220,12 @@ class PipelineState:
     images:List[Path]=field(default_factory=list)
     idx:int=0
     skeletons:List[SlideInsight]=field(default_factory=list)
+    skeleton_failed:bool=False    # added flag
     enriched:List[Tuple[SlideInsight,Dict[str,Any]]]=field(default_factory=list)
     final_slides:List[SlideInsight]=field(default_factory=list)
     outline:List[str]=field(default_factory=list)
-
+    merge_failed: bool = False
+    refine_failed: bool = False
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -236,6 +238,7 @@ def node_pass0(state):
 def node_skeleton(state):
     print(" Skeleton")
     # Extract PDF text layer
+    from PyPDF2 import PdfReader
     reader = PdfReader(str(state.pptx))
     try:
         page_text = reader.pages[state.idx].extract_text() or ""
@@ -254,7 +257,7 @@ def node_skeleton(state):
                 "title": {"type": ["string","null"]},
                 "subtitle": {"type": ["string","null"]},
                 "slide_type": {"type": "string", "enum": ["text","chart","diagram","image","mixed","cover","thank_you","appendix"]},
-                "rhetorical_role": {"type": ["string","null"], "enum": ["problem","cause","solution","evidence","benefit","summary","transition","introduction","other", None]},
+                "rhetorical_role": {"type": ["string","null"], "enum": ["problem","cause","solution","evidence","benefit","summary","transition","introduction","other"]},
                 "visual_elements": {"type":"array","items":{"type":"object","properties":{"type":{"type":"string"},"description":{"type":"string"},"extracted_text":{"type":"array","items":{"type":"string"}}},"required":["type","description","extracted_text"]}},
                 "bullet_points": {"type":"array","items":{"type":"string"}},
                 "paragraphs": {"type":"array","items":{"type":"string"}},
@@ -273,27 +276,33 @@ def node_skeleton(state):
     }
     # System and user messages
     sys_msg = {"role":"system","content":"Extract skeleton JSON"}
-    user_msg = {"role":"user","content":SKELETON_PROMPT + f"PDF Text:{page_text}","image":{"data":img_b64}}
-    resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[sys_msg, user_msg],
-        functions=[fn_skel],
-        function_call={"name":"extract_skeleton"},
-        response_format={"type":"json_object"}
-    )
-    raw = resp.choices[0].message.function_call.arguments
-    data = json.loads(raw)
-    # Ensure list fields are not None
-    for field in ["bullet_points","paragraphs","visual_elements","chart_data","emphasis_cues","referred_terms","key_takeaways"]:
-        if data.get(field) is None:
-            data[field] = []
-    data.setdefault("slide_index", state.idx)
+    user_msg = {"role":"user","content":SKELETON_PROMPT + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
     try:
-        ins = SlideInsight(**data)
-    except ValidationError:
-        data.setdefault("slide_type","mixed")
-        ins = SlideInsight(**data)
-    state.skeletons.append(ins)
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[sys_msg, user_msg],
+            functions=[fn_skel],
+            function_call={"name":"extract_skeleton"},
+            response_format={"type":"json_object"}
+        )
+        raw = resp.choices[0].message.function_call.arguments
+        data = json.loads(raw)
+        # Ensure list fields are not None
+        for field in ["bullet_points","paragraphs","visual_elements","chart_data","emphasis_cues","referred_terms","key_takeaways"]:
+            if data.get(field) is None:
+                data[field] = []
+        data.setdefault("slide_index", state.idx)
+        # Attempt to construct SlideInsight, retry skeleton on failure
+        try:
+            ins = SlideInsight(**data)
+            state.skeletons.append(ins)
+            state.skeleton_failed = False
+        except (ValidationError, ValueError) as ve:
+            print(f"SlideInsight construction failed (will retry skeleton): {ve}")
+            state.skeleton_failed = True
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Skeleton call failed (will retry skeleton): {e}")
+        state.skeleton_failed = True
     return state
 
 def node_enrich_mini(state):
@@ -326,7 +335,7 @@ def node_enrich_mini(state):
         }
     }
     sys_msg = {"role":"system","content":"Enrich slide with main content"}
-    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image":{"data":img_b64}}
+    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
     # Call using function-calling
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -378,7 +387,7 @@ def node_enrich_full(state):
         }
     }
     sys_msg = {"role":"system","content":"Fully enrich slide with all details"}
-    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image":{"data":img_b64}}
+    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
     resp = openai.chat.completions.create(
         model="gpt-4o",
         messages=[sys_msg, user_msg],
@@ -398,19 +407,28 @@ def node_enrich_full(state):
 
 def node_merge(state):
     print(" merge")
-    sk,data=state.enriched[-1]
-    merged=sk.dict();merged.update(data)
-    try:
-        slide=SlideInsight(**merged)
-        print(f"  slide={slide}")
-    except ValidationError as e:
-        print(f" [err]{e}")
-        merged.setdefault("slide_type","mixed")
+    sk, data = state.enriched[-1]
+    merged_dict = sk.dict()
+    merged_dict.update(data)
+    slide = None
+    # Retry merge on ValidationError by re-running enrichment
+    for i in range(MAX_JSON_RETRIES):
         try:
-            slide=SlideInsight(**merged)
-        except Exception as e:
-            print(f" [err]{e}")
-            slide=sk
+            slide = SlideInsight(**merged_dict)
+            break
+        except ValidationError as e:
+            print(f" Merge validation error, retry {i+1}/{MAX_JSON_RETRIES}: {e}")
+            # re-enrich based on quality gate
+            if low_quality(data, sk.slide_type):
+                state = node_enrich_full(state)
+            else:
+                state = node_enrich_mini(state)
+            sk, data = state.enriched[-1]
+            merged_dict = sk.dict()
+            merged_dict.update(data)
+    if slide is None:
+        print(" Merge failed after retries, using fallback skeleton")
+        slide = sk
     state.final_slides.append(slide)
     return state
 
@@ -507,20 +525,57 @@ def node_refine(state):
 # Graph
 # ---------------------------------------------------------------------------
 
+def cond_skeleton(state: PipelineState) -> str:
+    """Return 'skeleton' to retry or 'enrich_mini' to proceed."""
+    return "skeleton" if state.skeleton_failed else "enrich_mini"
+
+def cond_merge(state: PipelineState) -> str:
+    """Return 'merge' to retry or 'advance' to move on."""
+    return "merge" if getattr(state, 'merge_failed', False) else "advance"
+
+def cond_refine(state: PipelineState) -> str:
+    """Return 'refine' to retry or END to finish."""
+    return "refine" if getattr(state, 'refine_failed', False) else END
+
+# Build and compile the state graph with proper conditional loops
 def build_graph():
-    g=StateGraph(PipelineState)
+    g = StateGraph(PipelineState)
     g.set_entry_point("pass0")
-    nodes=[("pass0",node_pass0),("skeleton",node_skeleton),("enrich_mini",node_enrich_mini),("enrich_full",node_enrich_full),("merge",node_merge),("advance",node_advance),("refine",node_refine)]
-    for name,fn in nodes: g.add_node(name,fn)
-    edges=[("pass0","skeleton"),("skeleton","enrich_mini"),("enrich_mini","needs_full","enrich_full"),("enrich_mini","mini_ok","merge"),("enrich_full","merge"),("merge","advance"),("advance","iterate","skeleton"),("advance","done","refine"),("refine","END",None)]
-    g.add_edge("pass0","skeleton");
-    g.add_edge("skeleton","enrich_mini");
-    g.add_conditional_edges("enrich_mini",gate_quality,{"needs_full":"enrich_full","mini_ok":"merge"});
-    g.add_edge("enrich_full","merge");
-    g.add_edge("merge","advance");
-    g.add_conditional_edges("advance",cond_more,{"iterate":"skeleton","done":"refine"});
-    g.add_edge("refine",END)
-    # Compile graph with increased recursion limit to avoid GraphRecursionError
+    # Register nodes
+    g.add_node("pass0", node_pass0)
+    g.add_node("skeleton", node_skeleton)
+    g.add_node("enrich_mini", node_enrich_mini)
+    g.add_node("enrich_full", node_enrich_full)
+    g.add_node("merge", node_merge)
+    g.add_node("advance", node_advance)
+    g.add_node("refine", node_refine)
+    # Transitions
+    g.add_edge("pass0", "skeleton")
+    # Retry skeleton on failure else proceed to enrich
+    g.add_conditional_edges(
+        "skeleton", cond_skeleton,
+        {"skeleton": "skeleton", "enrich_mini": "enrich_mini"}
+    )
+    g.add_conditional_edges(
+        "enrich_mini", gate_quality,
+        {"needs_full": "enrich_full", "mini_ok": "merge"}
+    )
+    g.add_edge("enrich_full", "merge")
+    # Merge retries on failure, advance on success
+    g.add_conditional_edges(
+        "merge", cond_merge,
+        {"merge": "merge", "advance": "advance"}
+    )
+    # Advance to next slide or refine
+    g.add_conditional_edges(
+        "advance", cond_more,
+        {"iterate": "skeleton", "done": "refine"}
+    )
+    # Refine retries on failure, end on success
+    g.add_conditional_edges(
+        "refine", cond_refine,
+        {"refine": "refine", END: END}
+    )
     return g.compile()
 # ---------------------------------------------------------------------------
 # CLI
