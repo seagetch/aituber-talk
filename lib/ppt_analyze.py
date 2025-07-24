@@ -53,7 +53,7 @@ SlideType = Literal[
 ]
 RhetoricalRole = Literal[
     "problem", "cause", "solution", "evidence",
-    "benefit", "summary", "transition", "other",
+    "benefit", "summary", "transition", "introduction", "other",
 ]
 
 class VisualElement(BaseModel):
@@ -100,27 +100,64 @@ def get_openai_client(api_key: Optional[str]) -> None:
 # Prompt templates
 # ---------------------------------------------------------------------------
 SKELETON_PROMPT = (
-    "You are a helpful assistant that extracts skeleton metadata from a slide.\n"
-    "Return ONLY JSON with keys: slide_index (int), title (string|null), subtitle (string|null), slide_type (text|chart|diagram|image|mixed|cover|thank_you|appendix), rhetorical_role (problem|cause|solution|evidence|benefit|summary|transition|other|null).\n"
-    "If unknown, use null."
+    "You are a helpful assistant that extracts skeleton metadata from a slide. "
+    "Critically analyze the attached slide image to identify all visual elements including shapes, text regions, charts, diagrams, and icons, then combine with any extracted PDF text. "
+    "Return ONLY JSON with keys: "
+    "slide_index (int), "
+    "title (string|null), "
+    "subtitle (string|null), "
+    "slide_type (text|chart|diagram|image|mixed|cover|thank_you|appendix), "
+    "rhetorical_role (problem|cause|solution|evidence|benefit|summary|transition|introduction|other|null), "
+    "visual_elements (array of {type:string, description:string, extracted_text:string[]}), "
+    "bullet_points (string[]), "
+    "paragraphs (string[]), "
+    "emphasis_cues (string[]), "
+    "chart_data (array of {series_name:string, data_points:number[][]}), "
+    "speaker_notes (string|null), "
+    "referred_terms (string[]), "
+    "slide_intent (string|null), "
+    "key_takeaways (string[]), "
+    "prev_relation (string|null), "
+    "next_relation (string|null), "
+    "narration_draft (string|null). "
+    "If a field is not present, return null or an empty array as appropriate."
 )
+
 PROMPT_TEXT = (
-    "You are analyzing a text-centric slide. Extract bullet_points, paragraphs, emphasis_cues.\n"
-    "Return ONLY JSON with keys: slide_index (int), slide_type (string), rhetorical_role (string|null), title (string|null), subtitle (string|null), bullet_points (string[]), paragraphs (string[]), emphasis_cues (string[]), visual_elements (object[]), chart_data (object[]), speaker_notes (string|null), referred_terms (string[]), slide_intent (string|null), key_takeaways (string[]), prev_relation (string|null), next_relation (string|null), narration_draft (string|null)."
+    "You are analyzing a text-centric slide. Rigorously examine the slide image for visual elements (icons, highlights, layout) and integrate with the slide text."
+    "Extract visual_elements, bullet_points, paragraphs, emphasis_cues."
+    "Return ONLY JSON with the full SlideInsight schema as in SKELETON_PROMPT."
 )
+
 PROMPT_CHART = (
-    "You are analyzing a chart slide. Describe the visual and extract numbers/labels.\n"
-    "Return ONLY JSON with the same keys as text plus chart_data details: chart_data (series_name:string, data_points:number[][])."
+    "You are analyzing a chart slide. Carefully inspect the slide image to detect chart components (axes, bars, lines, legends) and read any chart labels, combining with the slide text."
+    "Extract visual_elements and chart_data (series_name, data_points), plus bullet_points, paragraphs, and key_takeaways."
+    "Return ONLY JSON with the full SlideInsight schema as in SKELETON_PROMPT."
 )
+
 PROMPT_DIAGRAM = (
-    "You are analyzing a diagram slide. Describe logic (inputs->outputs).\n"
-    "Return ONLY JSON with same schema as text."
+    "You are analyzing a diagram slide. Thoroughly parse the slide image to map nodes, connections, and annotations, then merge with available text."
+    "Extract visual_elements (nodes, arrows, labels), bullet_points, paragraphs, and slide_intent."
+    "Return ONLY JSON with the full SlideInsight schema as in SKELETON_PROMPT."
 )
+
 PROMPT_IMAGE = (
-    "You are analyzing an image-centric slide. Explain image message.\n"
-    "Return ONLY JSON with same schema as text."
+    "You are analyzing an image-centric slide. Perform full visual analysis on the slide image to identify objects, scenes, text overlays, and inferred messages."
+    "Extract visual_elements, slide_intent, and key_takeaways."
+    "Return ONLY JSON with the full SlideInsight schema as in SKELETON_PROMPT."
 )
-PROMPTS_BY_TYPE = {t: PROMPT_TEXT for t in ["text","mixed","cover","thank_you","appendix"]}
+
+PROMPTS_BY_TYPE = {
+    "text": PROMPT_TEXT,
+    "mixed": PROMPT_TEXT,
+    "cover": PROMPT_TEXT,
+    "thank_you": PROMPT_TEXT,
+    "appendix": PROMPT_TEXT,
+    "chart": PROMPT_CHART,
+    "diagram": PROMPT_DIAGRAM,
+    "image": PROMPT_IMAGE,
+}
+
 PROMPTS_BY_TYPE.update({"chart":PROMPT_CHART,"diagram":PROMPT_DIAGRAM,"image":PROMPT_IMAGE})
 
 # ---------------------------------------------------------------------------
@@ -198,41 +235,70 @@ def node_pass0(state):
 
 def node_skeleton(state):
     print(" Skeleton")
-    # Extract PDF text layer for this page
+    # Extract PDF text layer
     reader = PdfReader(str(state.pptx))
     try:
         page_text = reader.pages[state.idx].extract_text() or ""
     except Exception:
         page_text = ""
-    # Prepare combined prompt with image and text
     get_openai_client(state.api_key)
     img_b64 = base64.b64encode(state.images[state.idx].read_bytes()).decode('ascii')
-    content = (
-        SKELETON_PROMPT + ""
-        "Use both the slide image and the extracted text to determine metadata."
-        f"PDF Text:{page_text}"
-    )
-    msg = {"role": "user", "content": content, "image": {"data": img_b64}}
+    # Define function schema for extracting skeleton
+    fn_skel = {
+        "name": "extract_skeleton",
+        "description": "Extract slide skeleton metadata",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slide_index": {"type": "integer"},
+                "title": {"type": ["string","null"]},
+                "subtitle": {"type": ["string","null"]},
+                "slide_type": {"type": "string", "enum": ["text","chart","diagram","image","mixed","cover","thank_you","appendix"]},
+                "rhetorical_role": {"type": ["string","null"], "enum": ["problem","cause","solution","evidence","benefit","summary","transition","introduction","other", None]},
+                "visual_elements": {"type":"array","items":{"type":"object","properties":{"type":{"type":"string"},"description":{"type":"string"},"extracted_text":{"type":"array","items":{"type":"string"}}},"required":["type","description","extracted_text"]}},
+                "bullet_points": {"type":"array","items":{"type":"string"}},
+                "paragraphs": {"type":"array","items":{"type":"string"}},
+                "emphasis_cues": {"type":"array","items":{"type":"string"}},
+                "chart_data": {"type":"array","items":{"type":"object","properties":{"series_name":{"type":"string"},"data_points":{"type":"array","items":{"type":"array","items":{"type":"number"}}}},"required":["series_name","data_points"]}},
+                "speaker_notes": {"type":["string","null"]},
+                "referred_terms": {"type":"array","items":{"type":"string"}},
+                "slide_intent": {"type":["string","null"]},
+                "key_takeaways": {"type":"array","items":{"type":"string"}},
+                "prev_relation": {"type":["string","null"]},
+                "next_relation": {"type":["string","null"]},
+                "narration_draft": {"type":["string","null"]}
+            },
+            "required": ["slide_index","slide_type"]
+        }
+    }
+    # System and user messages
+    sys_msg = {"role":"system","content":"Extract skeleton JSON"}
+    user_msg = {"role":"user","content":SKELETON_PROMPT + f"PDF Text:{page_text}","image":{"data":img_b64}}
     resp = openai.chat.completions.create(
-        model="gpt-4o-mini", messages=[msg], response_format={"type": "json_object"}
+        model="gpt-4o-mini",
+        messages=[sys_msg, user_msg],
+        functions=[fn_skel],
+        function_call={"name":"extract_skeleton"},
+        response_format={"type":"json_object"}
     )
-    raw = resp.choices[0].message.content
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        print(" JSON parse error in skeleton, defaulting to minimal metadata")
-        data = {"slide_index": state.idx, "slide_type": "mixed"}
+    raw = resp.choices[0].message.function_call.arguments
+    data = json.loads(raw)
+    # Ensure list fields are not None
+    for field in ["bullet_points","paragraphs","visual_elements","chart_data","emphasis_cues","referred_terms","key_takeaways"]:
+        if data.get(field) is None:
+            data[field] = []
+    data.setdefault("slide_index", state.idx)
     try:
         ins = SlideInsight(**data)
     except ValidationError:
-        data.setdefault("slide_type", "mixed")
+        data.setdefault("slide_type","mixed")
         ins = SlideInsight(**data)
     state.skeletons.append(ins)
     return state
 
 def node_enrich_mini(state):
     print(" Enrich mini")
-    # Extract PDF text layer for this page
+    # Extract PDF text layer
     reader = PdfReader(str(state.pptx))
     try:
         page_text = reader.pages[state.idx].extract_text() or ""
@@ -241,32 +307,47 @@ def node_enrich_mini(state):
     get_openai_client(state.api_key)
     sk = state.skeletons[-1]
     img_b64 = base64.b64encode(state.images[state.idx].read_bytes()).decode('ascii')
-    # Combine prompt with image and text content
-    content = (
-        PROMPTS_BY_TYPE[sk.slide_type] + ""
-        "Use both the slide image and the extracted text to enrich the slide details."
-        f"PDF Text:{page_text}"
+    # Define function schema for mini enrichment
+    fn_mini = {
+        "name": "enrich_slide",
+        "description": "Extract detailed slide content",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slide_index": {"type": "integer"},
+                "visual_elements": {"type":"array","items":{"type":"object"}},
+                "bullet_points": {"type":"array","items":{"type":"string"}},
+                "paragraphs": {"type":"array","items":{"type":"string"}},
+                "emphasis_cues": {"type":"array","items":{"type":"string"}},
+                "slide_intent": {"type":["string","null"]},
+                "key_takeaways": {"type":"array","items":{"type":"string"}}
+            },
+            "required": ["slide_index"]
+        }
+    }
+    sys_msg = {"role":"system","content":"Enrich slide with main content"}
+    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image":{"data":img_b64}}
+    # Call using function-calling
+    resp = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[sys_msg, user_msg],
+        functions=[fn_mini],
+        function_call={"name":"enrich_slide"},
+        response_format={"type":"json_object"}
     )
-    data = None
-    for i in range(MAX_JSON_RETRIES):
-        resp = openai.chat.completions.create(
-            model="gpt-4o-mini", messages=[{"role":"user","content":content,"image":{"data":img_b64}}], response_format={"type": "json_object"}
-        )
-        raw = resp.choices[0].message.content
-        try:
-            data = json.loads(raw)
-            break
-        except json.JSONDecodeError:
-            print(f" JSON parse error in enrich_mini, retry {i+1}/{MAX_JSON_RETRIES}")
-    if data is None:
-        print(" JSON parse failed in enrich_mini after retries, using empty dict")
-        data = {}
+    raw = resp.choices[0].message.function_call.arguments
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        print(" JSON parse error in enrich_mini, using empty dict")
+        data = {"slide_index": state.idx}
+    data.setdefault("slide_index", state.idx)
     state.enriched.append((sk, data))
     return state
 
 def node_enrich_full(state):
     print(" Enrich full")
-    # Extract PDF text layer for this page
+    # Extract PDF text layer
     reader = PdfReader(str(state.pptx))
     try:
         page_text = reader.pages[state.idx].extract_text() or ""
@@ -275,25 +356,43 @@ def node_enrich_full(state):
     get_openai_client(state.api_key)
     sk = state.skeletons[-1]
     img_b64 = base64.b64encode(state.images[state.idx].read_bytes()).decode('ascii')
-    content = (
-        PROMPTS_BY_TYPE[sk.slide_type] + ""
-        "Use both the slide image and the extracted text to fully enrich the slide details."
-        f"PDF Text:{page_text}"
+    # Define function schema for full enrichment
+    fn_full = {
+        "name": "enrich_slide_full",
+        "description": "Extract complete slide content including visuals and text",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slide_index": {"type": "integer"},
+                "visual_elements": {"type":"array","items":{"type":"object"}},
+                "bullet_points": {"type":"array","items":{"type":"string"}},
+                "paragraphs": {"type":"array","items":{"type":"string"}},
+                "emphasis_cues": {"type":"array","items":{"type":"string"}},
+                "chart_data": {"type":"array","items":{"type":"object"}},
+                "speaker_notes": {"type":["string","null"]},
+                "referred_terms": {"type":"array","items":{"type":"string"}},
+                "slide_intent": {"type":["string","null"]},
+                "key_takeaways": {"type":"array","items":{"type":"string"}}
+            },
+            "required": ["slide_index"]
+        }
+    }
+    sys_msg = {"role":"system","content":"Fully enrich slide with all details"}
+    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image":{"data":img_b64}}
+    resp = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[sys_msg, user_msg],
+        functions=[fn_full],
+        function_call={"name":"enrich_slide_full"},
+        response_format={"type":"json_object"}
     )
-    data = None
-    for i in range(MAX_JSON_RETRIES):
-        resp = openai.chat.completions.create(
-            model="gpt-4o", messages=[{"role":"user","content":content,"image":{"data":img_b64}}], response_format={"type": "json_object"}
-        )
-        raw = resp.choices[0].message.content
-        try:
-            data = json.loads(raw)
-            break
-        except json.JSONDecodeError:
-            print(f" JSON parse error in enrich_full, retry {i+1}/{MAX_JSON_RETRIES}")
-    if data is None:
-        print(" JSON parse failed in enrich_full after retries, using empty dict")
-        data = {}
+    raw = resp.choices[0].message.function_call.arguments
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        print(" JSON parse error in enrich_full, using empty dict")
+        data = {"slide_index": state.idx}
+    data.setdefault("slide_index", state.idx)
     state.enriched[-1] = (sk, data)
     return state
 
@@ -301,14 +400,17 @@ def node_merge(state):
     print(" merge")
     sk,data=state.enriched[-1]
     merged=sk.dict();merged.update(data)
-    print(f"  merged={merged}")
     try:
         slide=SlideInsight(**merged)
         print(f"  slide={slide}")
-    except ValidationError:
+    except ValidationError as e:
+        print(f" [err]{e}")
         merged.setdefault("slide_type","mixed")
-        try:slide=SlideInsight(**merged)
-        except: slide=sk
+        try:
+            slide=SlideInsight(**merged)
+        except Exception as e:
+            print(f" [err]{e}")
+            slide=sk
     state.final_slides.append(slide)
     return state
 
@@ -435,9 +537,9 @@ def main():
     first_run = graph.invoke(state, config={"recursion_limit": 1000})
     final_state = first_run
     print("\nDeck Outline:")
-    for i,sec in enumerate(final_state.outline,1):print(f"  {i}. {sec}")
+    for i,sec in enumerate(state.outline,1):print(f"  {i}. {sec}")
     print(f"\nWriting slides to {args.out}")
     with open(args.out,"w",encoding="utf-8")as f:
-        for s in final_state.final_slides:f.write(json.dumps(s.dict(),ensure_ascii=False)+"\n")
+        for s in state.final_slides:f.write(json.dumps(s.dict(),ensure_ascii=False)+"\n")
 
 if __name__=="__main__":main()
