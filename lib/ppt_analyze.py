@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import openai
+#import openai
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field, ValidationError
 from pptx import Presentation
@@ -35,6 +35,9 @@ from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 from PIL import Image
 from tqdm import tqdm
+from langfuse import Langfuse
+from langfuse.decorators import observe
+from langfuse.openai import openai
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -276,7 +279,12 @@ def node_skeleton(state):
     }
     # System and user messages
     sys_msg = {"role":"system","content":"Extract skeleton JSON"}
-    user_msg = {"role":"user","content":SKELETON_PROMPT + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
+    user_msg = {
+        "role":"user",
+        "content":[ 
+            { "type": "text", "text": SKELETON_PROMPT + f"PDF Text:{page_text}" },
+            { "type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+        ]}
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -335,7 +343,12 @@ def node_enrich_mini(state):
         }
     }
     sys_msg = {"role":"system","content":"Enrich slide with main content"}
-    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
+    user_msg = {
+        "role":"user",
+        "content": [
+            { "type": "text", "text": PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}" },
+            { "type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+        ]}
     # Call using function-calling
     resp = openai.chat.completions.create(
         model="gpt-4o-mini",
@@ -387,7 +400,12 @@ def node_enrich_full(state):
         }
     }
     sys_msg = {"role":"system","content":"Fully enrich slide with all details"}
-    user_msg = {"role":"user","content":PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}","image_url": f"data:image/png;base64,{img_b64}"}
+    user_msg = {
+        "role":"user",
+        "content": [
+            { "type": "text", "text": PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}" },
+            { "type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+        ]}
     resp = openai.chat.completions.create(
         model="gpt-4o",
         messages=[sys_msg, user_msg],
@@ -589,12 +607,16 @@ def main():
     args=parser.parse_args()
     state=PipelineState(api_key=args.api_key or os.getenv("OPENAI_API_KEY",""),pptx=args.pptx)
     graph=build_graph()
-    first_run = graph.invoke(state, config={"recursion_limit": 1000})
+    @observe
+    def run():
+        first_run = graph.invoke(state, config={"recursion_limit": 1000})
+        return first_run
+    first_run = run()
     final_state = first_run
     print("\nDeck Outline:")
     for i,sec in enumerate(state.outline,1):print(f"  {i}. {sec}")
     print(f"\nWriting slides to {args.out}")
     with open(args.out,"w",encoding="utf-8")as f:
-        for s in state.final_slides:f.write(json.dumps(s.dict(),ensure_ascii=False)+"\n")
+        for s in state.final_slides:f.write(json.dumps(s.model_dump(),ensure_ascii=False)+"\n")
 
 if __name__=="__main__":main()
