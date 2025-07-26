@@ -196,11 +196,17 @@ def pdf_to_images(pdf_path: Path, dpi: int = DEFAULT_DPI) -> List[Path]:
 # Quality gate
 # ---------------------------------------------------------------------------
 def low_quality(data,slide_type):
+    # 画像要素が複数ある場合、詳細解析が必要と判断
+    visuals = data.get("visual_elements", [])
+    image_count = sum(1 for ve in visuals)
+    if image_count > 1:
+        return True
+    # 既存のチャート／テキスト判定
     if slide_type=="chart":
         if not data.get("chart_data"):
             return True
-        vis=data.get("visual_elements",[])
-        if vis and len(vis[0].get("extracted_text",[]))<2:
+        vis = data.get("visual_elements", [])
+        if vis and len(vis[0].get("extracted_text", [])) < 2:
             return True
     if slide_type=="text":
         if not data.get("bullet_points") and not data.get("paragraphs"):
@@ -378,40 +384,45 @@ def node_enrich_full(state):
     get_openai_client(state.api_key)
     sk = state.skeletons[-1]
     img_b64 = base64.b64encode(state.images[state.idx].read_bytes()).decode('ascii')
-    # Define function schema for full enrichment
+    # Define function schema for full enrichment including relationships and overall intent
     fn_full = {
         "name": "enrich_slide_full",
-        "description": "Extract complete slide content including visuals and text",
+        "description": "Extract complete slide content including visuals, relationships between elements, and overall slide intent",
         "parameters": {
             "type": "object",
             "properties": {
                 "slide_index": {"type": "integer"},
-                "visual_elements": {"type":"array","items":{"type":"object"}},
-                "bullet_points": {"type":"array","items":{"type":"string"}},
-                "paragraphs": {"type":"array","items":{"type":"string"}},
-                "emphasis_cues": {"type":"array","items":{"type":"string"}},
-                "chart_data": {"type":"array","items":{"type":"object"}},
-                "speaker_notes": {"type":["string","null"]},
-                "referred_terms": {"type":"array","items":{"type":"string"}},
-                "slide_intent": {"type":["string","null"]},
-                "key_takeaways": {"type":"array","items":{"type":"string"}}
+                "visual_elements": {"type": "array","items":{"type":"object"}},
+                "bullet_points": {"type": "array","items":{"type":"string"}},
+                "paragraphs": {"type": "array","items":{"type":"string"}},
+                "emphasis_cues": {"type": "array","items":{"type":"string"}},
+                "chart_data": {"type": "array","items":{"type":"object"}},
+                "speaker_notes": {"type": ["string","null"]},
+                "referred_terms": {"type": "array","items":{"type":"string"}},
+                "relationships": {
+                    "type": "array",
+                    "items": {"type": "object","properties": {"from": {"type": "string"}, "to": {"type": "string"}, "relation": {"type": "string"}}}
+                },
+                "overall_intent": {"type": ["string","null"]},
+                "key_takeaways": {"type": "array","items":{"type":"string"}}
             },
             "required": ["slide_index"]
         }
     }
-    sys_msg = {"role":"system","content":"Fully enrich slide with all details"}
+    sys_msg = {"role": "system", "content": "Fully enrich slide with all details, including relationships between visual elements and the overall slide intent."}
     user_msg = {
-        "role":"user",
+        "role": "user",
         "content": [
-            { "type": "text", "text": PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}" },
-            { "type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-        ]}
+            {"type": "text", "text": PROMPTS_BY_TYPE[sk.slide_type] + f"PDF Text:{page_text}\n- 画像間の関係性やレイアウトを詳細に分析し、そこから全体として何が言えるか説明してください。"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+        ]
+    }
     resp = openai.chat.completions.create(
         model="gpt-4o",
         messages=[sys_msg, user_msg],
         functions=[fn_full],
-        function_call={"name":"enrich_slide_full"},
-        response_format={"type":"json_object"}
+        function_call={"name": "enrich_slide_full"},
+        response_format={"type": "json_object"}
     )
     raw = resp.choices[0].message.function_call.arguments
     try:
@@ -433,6 +444,7 @@ def node_merge(state):
     for i in range(MAX_JSON_RETRIES):
         try:
             slide = SlideInsight(**merged_dict)
+            slide.slide_index = state.idx
             break
         except ValidationError as e:
             print(f" Merge validation error, retry {i+1}/{MAX_JSON_RETRIES}: {e}")
@@ -536,7 +548,11 @@ def node_refine(state):
     if out is None:
         print(" JSON parse failed in refine after retries, using fallback outline and slides")
         out = {"slides": [s.dict() for s in state.final_slides], "deck_outline": state.outline}
-    state.final_slides = [SlideInsight(**s) for s in out["slides"]]
+    try:
+        state.refine_failed = False
+        state.final_slides = [SlideInsight(**s) for s in out["slides"]]
+    except ValueError as e:
+        state.refine_failed = True
     state.outline = out.get("deck_outline", [])
     return state
 # ---------------------------------------------------------------------------
