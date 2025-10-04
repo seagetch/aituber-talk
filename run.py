@@ -617,7 +617,8 @@ def text_producer_thread(
             for sent in sentences:
                 tp_logger.info("[TextProducer] processing sentence: %r", sent)
                 wav = tts_generate(sent, current_style_id)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
+                tf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                try:
                     tf.write(wav)
                     tf.flush()
                     coeff = sadtalker_coeff(
@@ -627,6 +628,9 @@ def text_producer_thread(
                         pose_style,
                         no_blink
                     )
+                finally:
+                    tf.close()
+                    os.unlink(tf.name)
                 # motion_qにuuidを付与してput
                 motion_q.put((wav, coeff, req_id))
         except Exception as e:
