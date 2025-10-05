@@ -1,9 +1,0 @@
-name: aituber-talker-webui
-channels:
-  - conda-forge
-dependencies:
-  - python=3.11         # お好みのバージョンに合わせてください
-  - pip
-  - pip:
-    - gradio
-    - requests
