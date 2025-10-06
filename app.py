@@ -7,11 +7,17 @@ import argparse
 import sys
 import threading
 import time
+
+try:
+    import torch
+except ImportError:
+    torch = None
 from typing import Tuple
 
 import uvicorn
 
 from controller.app import ControllerApp
+from core.talk_engine import TalkEngineConfig
 from ui.web.app import build_ui
 
 
@@ -20,11 +26,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-host", default="127.0.0.1", help="Controller bind host")
     parser.add_argument("--controller-port", type=int, default=8001, help="Controller bind port")
     parser.add_argument("--ui-host", default="127.0.0.1", help="UI bind host")
+    parser.add_argument("--device", default="auto", help="PyTorch device (auto, cpu, cuda, cuda:0, mps, etc.)")
+    parser.add_argument("--list-devices", action="store_true", help="List detected PyTorch devices and exit")
     parser.add_argument("--ui-port", type=int, default=8000, help="UI bind port")
     parser.add_argument("--open-browser", action="store_true", help="Open browser on UI start")
     parser.add_argument("--log-level", default="info", help="uvicorn log level for the controller")
     return parser.parse_args()
 
+
+
+
+def detect_available_devices() -> list[str]:
+    devices = ["cpu"]
+    if torch is None:
+        return devices
+    try:
+        if torch.cuda.is_available():
+            count = torch.cuda.device_count()
+            for idx in range(count):
+                devices.append(f"cuda:{idx}")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devices.append("mps")
+    except Exception:
+        pass
+    return devices
+
+
+def resolve_device(choice: str) -> str:
+    choice = (choice or "auto").strip()
+    if choice.lower() == "auto":
+        devices = detect_available_devices()
+        return devices[1] if len(devices) > 1 else "cpu"
+    return choice
 
 def start_controller(host: str, port: int, log_level: str) -> Tuple[uvicorn.Server, threading.Thread]:
     controller = ControllerApp()
@@ -56,9 +89,19 @@ def start_controller(host: str, port: int, log_level: str) -> Tuple[uvicorn.Serv
 
 def main() -> None:
     args = parse_args()
+    if args.list_devices:
+        print("Available devices:")
+        for dev in detect_available_devices():
+            print(f"  - {dev}")
+        sys.exit(0)
+
     controller_url = f"http://{args.controller_host}:{args.controller_port}"
 
-    server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level)
+    device_choice = resolve_device(args.device)
+    print(f"Using TalkEngine device: {device_choice}")
+    engine_config = TalkEngineConfig(device=device_choice)
+
+    server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level, engine_config)
     ui = build_ui(controller_url=controller_url)
     try:
         ui.launch(
