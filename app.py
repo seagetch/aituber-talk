@@ -37,6 +37,20 @@ def start_controller(host: str, port: int, log_level: str) -> Tuple[uvicorn.Serv
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="ControllerServer", daemon=True)
     thread.start()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if server.started:
+            break
+        if not thread.is_alive():
+            break
+        time.sleep(0.1)
+
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=1)
+        raise RuntimeError(f"Controller failed to start on {host}:{port}. Is the port already in use?")
+
     return server, thread
 
 
@@ -46,13 +60,20 @@ def main() -> None:
 
     server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level)
     ui = build_ui(controller_url=controller_url)
-    ui.launch(
-        server_name=args.ui_host,
-        server_port=args.ui_port,
-        inbrowser=args.open_browser,
-        share=False,
-        prevent_thread_lock=True,
-    )
+    try:
+        ui.launch(
+            server_name=args.ui_host,
+            server_port=args.ui_port,
+            inbrowser=args.open_browser,
+            share=False,
+            prevent_thread_lock=True,
+        )
+    except OSError as exc:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+        raise RuntimeError(
+            f"UI failed to start on {args.ui_host}:{args.ui_port}: {exc}. Try specifying a different --ui-port."
+        ) from exc
 
     print("AITuber Desktop Suite running.")
     print(f"  Controller API: {controller_url}")
