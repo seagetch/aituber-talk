@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Unified launcher for controller service and Gradio UI."""
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ def resolve_device(choice: str) -> str:
         return devices[1] if len(devices) > 1 else "cpu"
     return choice
 
-def start_controller(host: str, port: int, log_level: str) -> Tuple[uvicorn.Server, threading.Thread]:
-    controller = ControllerApp()
+def start_controller(host: str, port: int, log_level: str, engine_config: TalkEngineConfig) -> Tuple[uvicorn.Server, threading.Thread]:
+    controller = ControllerApp(config=engine_config)
     config = uvicorn.Config(
         app=controller.fastapi,
         host=host,
@@ -143,3 +143,4 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         print(f"Failed to launch suite: {exc}", file=sys.stderr)
         sys.exit(1)
+
