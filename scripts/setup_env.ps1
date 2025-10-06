@@ -1,12 +1,51 @@
 ﻿param(
     [string]$EnvPath = ".venv",
-    [switch]$Force
+    [switch]$Force,
+    [string]$TorchChannel = "cu121",
+    [switch]$CpuTorch
 )
 
 $ErrorActionPreference = "Stop"
 
 function Write-Info($message) {
     Write-Host "[setup] $message"
+}
+
+function Install-PyTorch {
+    param(
+        [string]$PythonExe,
+        [string]$TorchChannel,
+        [switch]$CpuTorch
+    )
+
+    if ($CpuTorch) {
+        Write-Info "Installing PyTorch (CPU build)"
+        & $PythonExe -m pip install --upgrade torch torchvision torchaudio
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install CPU PyTorch packages"
+        }
+        return
+    }
+
+    if (-not $TorchChannel) {
+        Write-Info "TorchChannel parameter empty; installing CPU build"
+        & $PythonExe -m pip install --upgrade torch torchvision torchaudio
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install CPU PyTorch packages"
+        }
+        return
+    }
+
+    Write-Info "Installing PyTorch (channel: $TorchChannel)"
+    $extraIndex = "https://download.pytorch.org/whl/$TorchChannel"
+    & $PythonExe -m pip install --upgrade torch torchvision torchaudio --extra-index-url $extraIndex
+    if ($LASTEXITCODE -ne 0) {
+        Write-Info "CUDA installation failed; falling back to CPU build"
+        & $PythonExe -m pip install --upgrade torch torchvision torchaudio
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install PyTorch packages"
+        }
+    }
 }
 
 if (Test-Path $EnvPath) {
@@ -43,5 +82,7 @@ Write-Info "Installing requirements"
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to install requirements"
 }
+
+Install-PyTorch -PythonExe $pythonExe -TorchChannel $TorchChannel -CpuTorch:$CpuTorch
 
 Write-Info "Setup complete. Activate the environment with `& \"$EnvPath\Scripts\Activate.ps1\"`."
