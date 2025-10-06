@@ -1,4 +1,4 @@
-﻿"""Gradio UI targeting the controller service with mode-specific controls and live updates."""
+"""Gradio UI targeting the controller service with mode-specific controls and live updates."""
 
 from __future__ import annotations
 
@@ -110,6 +110,30 @@ def upload_asset(controller_url: str, file_path: Optional[str]) -> tuple[Optiona
         return None, f"Upload failed for {file_path}: {exc}"
     return None, "Unexpected upload response"
 
+def list_uploaded_files(controller_url: str) -> List[Dict[str, Any]]:
+    data = _fetch_json("GET", f"{controller_url}/files", timeout=5)
+    if isinstance(data, dict) and "files" in data:
+        return data.get("files", [])
+    return []
+
+
+def delete_uploaded_file(controller_url: str, filename: str) -> Optional[str]:
+    response = _fetch_json("DELETE", f"{controller_url}/files/{filename}", timeout=5)
+    if isinstance(response, dict) and "error" in response:
+        return response["error"]
+    return None
+
+
+def _human_size(num_bytes: int) -> str:
+    step = 1024.0
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < step:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= step
+    return f"{value:.1f} PB"
+
 
 PRESENT_EVENT_TYPES = {
     "presentation_started",
@@ -203,8 +227,8 @@ def render_present_cards(details: Dict[str, Dict[str, Any]], selected_id: Option
         if slides_total:
             progress_pct = max(0.0, min(100.0, (current_slide / slides_total) * 100.0))
         status_label = (session_info.get("status") or "running").lower()
-        script_name = Path(metadata.get("script_path", "")).name if metadata.get("script_path") else "—"
-        ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "—"
+        script_name = Path(metadata.get("script_path", "")).name if metadata.get("script_path") else "?"
+        ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "?"
         current_title = status_info.get("current_title")
         flags: List[str] = []
         if current_title:
@@ -247,7 +271,7 @@ def format_present_status(detail: Dict[str, Any]) -> str:
     status_info = detail.get("status", {}) or {}
     metadata = session.get("metadata", {}) or {}
     lines = [
-        f"**Session:** {session.get('id', '—')} ({session.get('status', 'unknown')})",
+        f"**Session:** {session.get('id', '?')} ({session.get('status', 'unknown')})",
     ]
     slides_total = status_info.get("slides_total") or metadata.get("slides_total")
     current_slide = status_info.get("current_slide") or 0
@@ -255,9 +279,9 @@ def format_present_status(detail: Dict[str, Any]) -> str:
     title = status_info.get("current_title")
     if title:
         lines.append(f"**Slide title:** {title}")
-    script_name = Path(metadata.get("script_path", "")).name if metadata.get("script_path") else "—"
+    script_name = Path(metadata.get("script_path", "")).name if metadata.get("script_path") else "?"
     lines.append(f"**Script:** {script_name}")
-    ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "—"
+    ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "?"
     lines.append(f"**PowerPoint:** {ppt_name}")
     paused = status_info.get("paused")
     if paused is not None:
@@ -321,402 +345,550 @@ def build_ui(
             return resp["error"]
         return json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
 
+
     def submit_present(
         style_choice: Optional[str],
-        script_path: Optional[str],
-        ppt_path: Optional[str],
+        script_upload: Optional[str],
+        script_choice: Optional[str],
+        ppt_upload: Optional[str],
+        ppt_choice: Optional[str],
         wait_seconds: float,
         timeout_seconds: float,
+        uploads_cache: Optional[List[Dict[str, Any]]],
     ) -> Tuple[str, Optional[str]]:
+        uploads = uploads_cache or []
+        files_by_name = {entry.get("name"): entry for entry in uploads if isinstance(entry, dict)}
+    
+        def resolve_existing(name: Optional[str]) -> Optional[str]:
+            if not name:
+                return None
+            entry = files_by_name.get(name)
+            if entry:
+                return entry.get("path")
+            return None
+    
         style_id = parse_style(style_choice)
-        script_uploaded, err = upload_asset(controller_url, script_path)
-        if err:
-            return err, None
-        if not script_uploaded:
-            return "Please upload a script file (.md or .txt)", None
+    
+        script_server_path = resolve_existing(script_choice)
+        if not script_server_path and script_upload:
+            script_server_path, err = upload_asset(controller_url, script_upload)
+            if err:
+                return err, None
+            script_choice = Path(script_server_path or "").name if script_server_path else script_choice
+        if not script_server_path:
+            return "Please provide or select a script (.md or .txt)", None
+    
+        ppt_server_path = resolve_existing(ppt_choice)
+        if not ppt_server_path and ppt_upload:
+            ppt_server_path, err = upload_asset(controller_url, ppt_upload)
+            if err:
+                return err, None
+            ppt_choice = Path(ppt_server_path or "").name if ppt_server_path else ppt_choice
+    
         payload: Dict[str, Any] = {
             "mode": "present",
             "payload": {
-                "script_path": script_uploaded,
+                "script_path": script_server_path,
                 "wait": float(wait_seconds),
                 "timeout": float(timeout_seconds),
                 "style_id": style_id,
             },
         }
-        if ppt_path:
-            ppt_uploaded, err = upload_asset(controller_url, ppt_path)
-            if err:
-                return err, None
-            if ppt_uploaded:
-                payload["payload"]["ppt_path"] = ppt_uploaded
+        if ppt_server_path:
+            payload["payload"]["ppt_path"] = ppt_server_path
+    
         resp = create_session(controller_url, payload)
         if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
             return resp["error"], None
         session_id = resp.get("session", {}).get("id") if isinstance(resp, dict) else None
         message = json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
         return message, session_id
-
-    def get_event_log_text() -> str:
-        return "\n".join(event_log) if event_log else "No events yet."
-
-    def append_log(event_name: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        timestamp = time.strftime("%H:%M:%S")
-        summary: Optional[str] = None
-        session_ref: Optional[str] = None
-        if isinstance(payload, dict):
-            session_ref = payload.get('session')
-            if event_name == "presentation_started":
-                summary = f"session={session_ref} slides={payload.get('slides')}"
-            elif event_name == "presentation_slide_started":
-                summary = f"slide={payload.get('slide')} title={payload.get('title') or '?'}"
-            elif event_name == "presentation_slide_completed":
-                summary = f"slide={payload.get('slide')} status={payload.get('status')}"
-            elif event_name == "presentation_finished":
-                summary = f"status={payload.get('status')} slides={payload.get('slides')}"
-            elif event_name == "presentation_error":
-                summary = f"stage={payload.get('stage')} error={payload.get('error')}"
-            elif event_name == "presentation_stopped":
-                summary = f"session={session_ref}"
-            elif event_name == "speech_queued":
-                summary = f"session={session_ref} request={payload.get('request')}"
-            elif event_name == "speech_completed":
-                summary = f"session={session_ref} status={payload.get('status')}"
-            elif event_name == "speech_stopped":
-                summary = f"session={session_ref}"
-            elif event_name == "speech_error":
-                summary = f"session={session_ref} error={payload.get('error')}"
-            elif event_name == "presentation_slide_progress":
-                summary = f"session={session_ref} slide={payload.get('slide')} title={payload.get('title') or '?'}"
-            elif event_name == "presentation_status_change":
-                summary = f"session={session_ref} status={payload.get('status')}"
-        if summary is None and payload is not None:
-            try:
-                payload_text = json.dumps(payload, ensure_ascii=False)
-            except TypeError:
-                payload_text = str(payload)
-            summary = payload_text
-        message = f"[{timestamp}] {event_name}: {summary}" if summary else f"[{timestamp}] {event_name}"
-        event_log.append(message)
-        if session_ref:
-            if event_name in {"presentation_slide_started", "presentation_slide_completed", "presentation_slide_progress"} and isinstance(payload, dict):
-                slide = payload.get('slide')
-                if slide is not None:
-                    slide_event_tracker[session_ref] = slide
-            if event_name in {"presentation_finished", "presentation_error", "presentation_stopped", "presentation_started", "presentation_status_change"} and isinstance(payload, dict):
-                status_value = payload.get('status')
-                if status_value is None:
-                    if event_name == "presentation_error":
-                        status_value = 'error'
-                    elif event_name == "presentation_stopped":
-                        status_value = 'stopped'
-                    elif event_name == "presentation_started":
-                        status_value = 'running'
-                if status_value is not None:
-                    status_event_tracker[session_ref] = status_value
-            if event_name in {"presentation_slide_progress"} and isinstance(payload, dict):
-                slide_event_tracker[session_ref] = payload.get('slide') or slide_event_tracker.get(session_ref, 0)
-
-
-
-    def track_progress(session_id: Optional[str], detail: Dict[str, Any]) -> None:
-        if not session_id:
-            return
-        status_info = detail.get('status', {}) or {}
-        session_info = detail.get('session', {}) or {}
-        metadata = session_info.get('metadata', {}) or {}
-        current_slide = status_info.get('current_slide') or 0
-        current_title = status_info.get('current_title')
-        slides_total = status_info.get('slides_total') or metadata.get('slides_total')
-        status_label = session_info.get('status')
-        prev = snapshot_cache.get(session_id)
-        if prev is None:
+    
+        def get_event_log_text() -> str:
+            return "\n".join(event_log) if event_log else "No events yet."
+    
+    def load_upload_choices() -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]], List[Tuple[str, str]]]:
+        files = list_uploaded_files(controller_url)
+        script_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".md", ".txt")]
+        ppt_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".ppt", ".pptx")]
+    
+        def build_choices(items: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+            choices: List[Tuple[str, str]] = []
+            for item in items:
+                name = item.get("name")
+                if not name:
+                    continue
+                size = item.get("size", 0)
+                label = f"{name} ({_human_size(int(size))})"
+                choices.append((label, name))
+            return choices
+    
+        return files, build_choices(script_entries), build_choices(ppt_entries)
+    
+    def refresh_upload_components(current_script: Optional[str], current_ppt: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
+        files, script_choices, ppt_choices = load_upload_choices()
+        script_values = {value for _, value in script_choices}
+        ppt_values = {value for _, value in ppt_choices}
+        script_value = current_script if current_script in script_values else None
+        ppt_value = current_ppt if current_ppt in ppt_values else None
+        return (
+            gr.update(choices=script_choices, value=script_value),
+            gr.update(choices=ppt_choices, value=ppt_value),
+            files,
+            "",
+        )
+    
+    def delete_upload_entry(target: str, script_selected: Optional[str], ppt_selected: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
+        filename = script_selected if target == "script" else ppt_selected
+        if not filename:
+            files, script_choices, ppt_choices = load_upload_choices()
+            script_values = {value for _, value in script_choices}
+            ppt_values = {value for _, value in ppt_choices}
+            script_value = script_selected if script_selected in script_values else None
+            ppt_value = ppt_selected if ppt_selected in ppt_values else None
+            return (
+                gr.update(choices=script_choices, value=script_value),
+                gr.update(choices=ppt_choices, value=ppt_value),
+                files,
+                "Select a file to delete first.",
+            )
+        error = delete_uploaded_file(controller_url, filename)
+        if error:
+            files, script_choices, ppt_choices = load_upload_choices()
+            script_values = {value for _, value in script_choices}
+            ppt_values = {value for _, value in ppt_choices}
+            script_value = script_selected if script_selected in script_values else None
+            ppt_value = ppt_selected if ppt_selected in ppt_values else None
+            return (
+                gr.update(choices=script_choices, value=script_value),
+                gr.update(choices=ppt_choices, value=ppt_value),
+                files,
+                error,
+            )
+        files, script_choices, ppt_choices = load_upload_choices()
+        script_values = {value for _, value in script_choices}
+        ppt_values = {value for _, value in ppt_choices}
+        script_value = script_selected if (target != "script" and script_selected in script_values) else None
+        ppt_value = ppt_selected if (target != "ppt" and ppt_selected in ppt_values) else None
+        message = f"Deleted {filename}."
+        return (
+            gr.update(choices=script_choices, value=script_value),
+            gr.update(choices=ppt_choices, value=ppt_value),
+            files,
+            message,
+        )
+    
+        def append_log(event_name: str, payload: Optional[Dict[str, Any]] = None) -> None:
+            timestamp = time.strftime("%H:%M:%S")
+            summary: Optional[str] = None
+            session_ref: Optional[str] = None
+            if isinstance(payload, dict):
+                session_ref = payload.get('session')
+                if event_name == "presentation_started":
+                    summary = f"session={session_ref} slides={payload.get('slides')}"
+                elif event_name == "presentation_slide_started":
+                    summary = f"slide={payload.get('slide')} title={payload.get('title') or '?'}"
+                elif event_name == "presentation_slide_completed":
+                    summary = f"slide={payload.get('slide')} status={payload.get('status')}"
+                elif event_name == "presentation_finished":
+                    summary = f"status={payload.get('status')} slides={payload.get('slides')}"
+                elif event_name == "presentation_error":
+                    summary = f"stage={payload.get('stage')} error={payload.get('error')}"
+                elif event_name == "presentation_stopped":
+                    summary = f"session={session_ref}"
+                elif event_name == "speech_queued":
+                    summary = f"session={session_ref} request={payload.get('request')}"
+                elif event_name == "speech_completed":
+                    summary = f"session={session_ref} status={payload.get('status')}"
+                elif event_name == "speech_stopped":
+                    summary = f"session={session_ref}"
+                elif event_name == "speech_error":
+                    summary = f"session={session_ref} error={payload.get('error')}"
+                elif event_name == "presentation_slide_progress":
+                    summary = f"session={session_ref} slide={payload.get('slide')} title={payload.get('title') or '?'}"
+                elif event_name == "presentation_status_change":
+                    summary = f"session={session_ref} status={payload.get('status')}"
+            if summary is None and payload is not None:
+                try:
+                    payload_text = json.dumps(payload, ensure_ascii=False)
+                except TypeError:
+                    payload_text = str(payload)
+                summary = payload_text
+            message = f"[{timestamp}] {event_name}: {summary}" if summary else f"[{timestamp}] {event_name}"
+            event_log.append(message)
+            if session_ref:
+                if event_name in {"presentation_slide_started", "presentation_slide_completed", "presentation_slide_progress"} and isinstance(payload, dict):
+                    slide = payload.get('slide')
+                    if slide is not None:
+                        slide_event_tracker[session_ref] = slide
+                if event_name in {"presentation_finished", "presentation_error", "presentation_stopped", "presentation_started", "presentation_status_change"} and isinstance(payload, dict):
+                    status_value = payload.get('status')
+                    if status_value is None:
+                        if event_name == "presentation_error":
+                            status_value = 'error'
+                        elif event_name == "presentation_stopped":
+                            status_value = 'stopped'
+                        elif event_name == "presentation_started":
+                            status_value = 'running'
+                    if status_value is not None:
+                        status_event_tracker[session_ref] = status_value
+                if event_name in {"presentation_slide_progress"} and isinstance(payload, dict):
+                    slide_event_tracker[session_ref] = payload.get('slide') or slide_event_tracker.get(session_ref, 0)
+    
+    
+    
+        def track_progress(session_id: Optional[str], detail: Dict[str, Any]) -> None:
+            if not session_id:
+                return
+            status_info = detail.get('status', {}) or {}
+            session_info = detail.get('session', {}) or {}
+            metadata = session_info.get('metadata', {}) or {}
+            current_slide = status_info.get('current_slide') or 0
+            current_title = status_info.get('current_title')
+            slides_total = status_info.get('slides_total') or metadata.get('slides_total')
+            status_label = session_info.get('status')
+            prev = snapshot_cache.get(session_id)
+            if prev is None:
+                snapshot_cache[session_id] = {
+                    'slide': current_slide,
+                    'status': status_label,
+                }
+                return
+            recorded_slide = slide_event_tracker.get(session_id)
+            if current_slide and current_slide != prev.get('slide') and current_slide != recorded_slide:
+                append_log(
+                    'presentation_slide_progress',
+                    {
+                        'session': session_id,
+                        'slide': current_slide,
+                        'slides_total': slides_total,
+                        'title': current_title,
+                    },
+                )
+                slide_event_tracker[session_id] = current_slide
+            recorded_status = status_event_tracker.get(session_id)
+            if status_label and status_label != prev.get('status') and status_label != recorded_status:
+                append_log(
+                    'presentation_status_change',
+                    {
+                        'session': session_id,
+                        'status': status_label,
+                    },
+                )
+                status_event_tracker[session_id] = status_label
             snapshot_cache[session_id] = {
                 'slide': current_slide,
                 'status': status_label,
             }
-            return
-        recorded_slide = slide_event_tracker.get(session_id)
-        if current_slide and current_slide != prev.get('slide') and current_slide != recorded_slide:
-            append_log(
-                'presentation_slide_progress',
-                {
-                    'session': session_id,
-                    'slide': current_slide,
-                    'slides_total': slides_total,
-                    'title': current_title,
-                },
-            )
-            slide_event_tracker[session_id] = current_slide
-        recorded_status = status_event_tracker.get(session_id)
-        if status_label and status_label != prev.get('status') and status_label != recorded_status:
-            append_log(
-                'presentation_status_change',
-                {
-                    'session': session_id,
-                    'status': status_label,
-                },
-            )
-            status_event_tracker[session_id] = status_label
-        snapshot_cache[session_id] = {
-            'slide': current_slide,
-            'status': status_label,
-        }
-
-    def present_snapshot(selected_session: Optional[str]) -> Tuple[str, Any, str, Optional[str]]:
-        sessions = list_present_sessions(controller_url)
-        detail_map: Dict[str, Dict[str, Any]] = {}
-        for session in sessions:
-            sid = session.get("id")
-            if not sid:
-                continue
-            detail = get_session_status(controller_url, sid)
-            if isinstance(detail, dict):
-                detail.setdefault("session", session)
-            else:
-                detail = {"session": session, "status": {}, "error": detail}
-            if "session" not in detail or not detail["session"]:
-                detail["session"] = session
-            detail_map[sid] = detail
-        if not detail_map:
-            with selection_lock:
-                present_selection["id"] = None
-            return (
-                "<div class='session-empty'>No active presentation sessions.</div>",
-                gr.update(choices=[], value=None),
-                "No active presentation sessions.",
-                None,
-            )
-        ordered_ids = sorted(
-            detail_map.keys(),
-            key=lambda sid: detail_map[sid].get("session", {}).get("created_at", 0) or 0,
-            reverse=True,
-        )
-        active_ids = [
-            sid
-            for sid in ordered_ids
-            if detail_map[sid].get("session", {}).get("status") not in {"completed", "stopped"}
-        ]
-        if selected_session not in detail_map:
-            selected_session = active_ids[0] if active_ids else ordered_ids[0]
-        cards_html = render_present_cards(detail_map, selected_session)
-        status_text = (
-            format_present_status(detail_map[selected_session]) if selected_session else "No active presentation sessions."
-        )
-        dropdown = gr.update(choices=ordered_ids, value=selected_session)
-        with selection_lock:
-            present_selection["id"] = selected_session
-        if selected_session:
-            track_progress(selected_session, detail_map[selected_session])
-        return cards_html, dropdown, status_text, selected_session
-
-    def refresh_present(selected_session: Optional[str]):
-        cards_html, dropdown, status_text, selected_session = present_snapshot(selected_session)
-        return cards_html, dropdown, status_text, get_event_log_text(), selected_session
-
-    def refresh_sessions_json() -> str:
-        sessions = list_sessions(controller_url)
-        return json.dumps(sessions, ensure_ascii=False, indent=2) or "[]"
-
-    def watch_present_sessions(initial_selection: Optional[str]):
-        selected = initial_selection
-        cards_html, dropdown, status_text, selected = present_snapshot(selected)
-        yield cards_html, dropdown, status_text, get_event_log_text(), selected
-
-        events_q: Queue[Tuple[str, Dict[str, Any]]] = Queue()
-        stop_event = threading.Event()
-
-        def pump_events() -> None:
-            try:
-                for event in _iter_controller_events(controller_url, stop_event):
-                    events_q.put(event)
-            except Exception as exc:
-                events_q.put(("__error__", {"error": str(exc)}))
-            finally:
-                events_q.put(("__closed__", {}))
-
-        listener = threading.Thread(
-            target=pump_events,
-            name="present-event-listener",
-            daemon=True,
-        )
-        listener.start()
-
-        last_emit = time.monotonic()
-        try:
-            while True:
-                try:
-                    event_name, payload = events_q.get(timeout=2.0)
-                except Empty:
-                    event_name, payload = "__tick__", {}
-                if event_name == "__closed__":
-                    append_log("stream_closed")
-                    break
-                log_name: Optional[str] = None
-                log_payload: Optional[Dict[str, Any]] = None
-                if event_name == "__tick__":
-                    # yield even on tick to keep snapshot cache up to date
-                    pass
-                elif event_name == "__timeout__":
-                    log_name, log_payload = "stream_timeout", None
-                elif event_name == "__connected__":
-                    log_name, log_payload = "stream_connected", None
-                elif event_name == "__error__":
-                    log_name, log_payload = "stream_error", payload or {}
-                elif event_name in PRESENT_EVENT_TYPES:
-                    log_name, log_payload = event_name, payload or {}
-                else:
+    
+        def present_snapshot(selected_session: Optional[str]) -> Tuple[str, Any, str, Optional[str]]:
+            sessions = list_present_sessions(controller_url)
+            detail_map: Dict[str, Dict[str, Any]] = {}
+            for session in sessions:
+                sid = session.get("id")
+                if not sid:
                     continue
-                if event_name not in {"__tick__", "__timeout__"} and log_name:
-                    append_log(log_name, log_payload)
+                detail = get_session_status(controller_url, sid)
+                if isinstance(detail, dict):
+                    detail.setdefault("session", session)
+                else:
+                    detail = {"session": session, "status": {}, "error": detail}
+                if "session" not in detail or not detail["session"]:
+                    detail["session"] = session
+                detail_map[sid] = detail
+            if not detail_map:
                 with selection_lock:
-                    selected = present_selection["id"]
-                cards_html, dropdown, status_text, selected = present_snapshot(selected)
-                yield cards_html, dropdown, status_text, get_event_log_text(), selected
-                last_emit = time.monotonic()
-        finally:
-            stop_event.set()
-            listener.join(timeout=1.0)
-
-    def test_event_stream() -> str:
-        try:
-            with requests.get(
-                f"{controller_url.rstrip('/')}/events",
-                stream=True,
-                timeout=(3, 5),
-                headers={"Accept": "text/event-stream"},
-            ) as resp:
-                resp.raise_for_status()
-                start = time.monotonic()
-                for raw_line in resp.iter_lines(decode_unicode=True):
-                    if raw_line:
-                        return f"Received: {raw_line}"
-                    if time.monotonic() - start > 3:
-                        break
-            return "Connected to /events but no data within 3 seconds."
-        except requests_exceptions.ReadTimeout:
-            return "Connected, but no events arrived before the timeout."
-        except Exception as exc:
-            return f"Error: {exc}"
-
-    demo = gr.Blocks(title="AITuber Controller UI")
-    with demo:
-        gr.HTML(STYLE)
-        gr.Markdown("## AITuber Controller")
-        gr.Markdown(
-            "Upload presentation assets and send requests to the controller service. Talk and Present modes expose their own controls below."
-        )
-
-        with gr.Row():
-            speaker_dropdown = gr.Dropdown(choices=speaker_names, value=default_speaker, label="Speaker")
-            style_dropdown = gr.Dropdown(choices=initial_styles, value=default_style_choice, label="Style")
-            speaker_dropdown.change(
-                lambda name: gr.update(
-                    choices=(choices := style_choices(name)),
-                    value=choices[0] if choices else None,
-                ),
-                inputs=[speaker_dropdown],
-                outputs=[style_dropdown],
+                    present_selection["id"] = None
+                return (
+                    "<div class='session-empty'>No active presentation sessions.</div>",
+                    gr.update(choices=[], value=None),
+                    "No active presentation sessions.",
+                    None,
+                )
+            ordered_ids = sorted(
+                detail_map.keys(),
+                key=lambda sid: detail_map[sid].get("session", {}).get("created_at", 0) or 0,
+                reverse=True,
             )
-
-        with gr.Tabs():
-            with gr.TabItem("Talk"):
-                talk_text = gr.Textbox(label="Text", lines=4)
-                talk_sync = gr.Checkbox(label="Wait for completion", value=False)
-                talk_button = gr.Button("Send Talk Request")
-                talk_result = gr.Textbox(label="Result", interactive=False)
-                talk_button.click(
-                    submit_talk,
-                    inputs=[talk_text, style_dropdown, talk_sync],
-                    outputs=talk_result,
+            active_ids = [
+                sid
+                for sid in ordered_ids
+                if detail_map[sid].get("session", {}).get("status") not in {"completed", "stopped"}
+            ]
+            if selected_session not in detail_map:
+                selected_session = active_ids[0] if active_ids else ordered_ids[0]
+            cards_html = render_present_cards(detail_map, selected_session)
+            status_text = (
+                format_present_status(detail_map[selected_session]) if selected_session else "No active presentation sessions."
+            )
+            dropdown = gr.update(choices=ordered_ids, value=selected_session)
+            with selection_lock:
+                present_selection["id"] = selected_session
+            if selected_session:
+                track_progress(selected_session, detail_map[selected_session])
+            return cards_html, dropdown, status_text, selected_session
+    
+        def refresh_present(selected_session: Optional[str]):
+            cards_html, dropdown, status_text, selected_session = present_snapshot(selected_session)
+            return cards_html, dropdown, status_text, get_event_log_text(), selected_session
+    
+        def refresh_sessions_json() -> str:
+            sessions = list_sessions(controller_url)
+            return json.dumps(sessions, ensure_ascii=False, indent=2) or "[]"
+    
+        def watch_present_sessions(initial_selection: Optional[str]):
+            selected = initial_selection
+            cards_html, dropdown, status_text, selected = present_snapshot(selected)
+            yield cards_html, dropdown, status_text, get_event_log_text(), selected
+    
+            events_q: Queue[Tuple[str, Dict[str, Any]]] = Queue()
+            stop_event = threading.Event()
+    
+            def pump_events() -> None:
+                try:
+                    for event in _iter_controller_events(controller_url, stop_event):
+                        events_q.put(event)
+                except Exception as exc:
+                    events_q.put(("__error__", {"error": str(exc)}))
+                finally:
+                    events_q.put(("__closed__", {}))
+    
+            listener = threading.Thread(
+                target=pump_events,
+                name="present-event-listener",
+                daemon=True,
+            )
+            listener.start()
+    
+            last_emit = time.monotonic()
+            try:
+                while True:
+                    try:
+                        event_name, payload = events_q.get(timeout=2.0)
+                    except Empty:
+                        event_name, payload = "__tick__", {}
+                    if event_name == "__closed__":
+                        append_log("stream_closed")
+                        break
+                    log_name: Optional[str] = None
+                    log_payload: Optional[Dict[str, Any]] = None
+                    if event_name == "__tick__":
+                        # yield even on tick to keep snapshot cache up to date
+                        pass
+                    elif event_name == "__timeout__":
+                        log_name, log_payload = "stream_timeout", None
+                    elif event_name == "__connected__":
+                        log_name, log_payload = "stream_connected", None
+                    elif event_name == "__error__":
+                        log_name, log_payload = "stream_error", payload or {}
+                    elif event_name in PRESENT_EVENT_TYPES:
+                        log_name, log_payload = event_name, payload or {}
+                    else:
+                        continue
+                    if event_name not in {"__tick__", "__timeout__"} and log_name:
+                        append_log(log_name, log_payload)
+                    with selection_lock:
+                        selected = present_selection["id"]
+                    cards_html, dropdown, status_text, selected = present_snapshot(selected)
+                    yield cards_html, dropdown, status_text, get_event_log_text(), selected
+                    last_emit = time.monotonic()
+            finally:
+                stop_event.set()
+                listener.join(timeout=1.0)
+    
+        def test_event_stream() -> str:
+            try:
+                with requests.get(
+                    f"{controller_url.rstrip('/')}/events",
+                    stream=True,
+                    timeout=(3, 5),
+                    headers={"Accept": "text/event-stream"},
+                ) as resp:
+                    resp.raise_for_status()
+                    start = time.monotonic()
+                    for raw_line in resp.iter_lines(decode_unicode=True):
+                        if raw_line:
+                            return f"Received: {raw_line}"
+                        if time.monotonic() - start > 3:
+                            break
+                return "Connected to /events but no data within 3 seconds."
+            except requests_exceptions.ReadTimeout:
+                return "Connected, but no events arrived before the timeout."
+            except Exception as exc:
+                return f"Error: {exc}"
+    
+        demo = gr.Blocks(title="AITuber Controller UI")
+        with demo:
+            gr.HTML(STYLE)
+            gr.Markdown("## AITuber Controller")
+            gr.Markdown(
+                "Upload presentation assets and send requests to the controller service. Talk and Present modes expose their own controls below."
+            )
+    
+            with gr.Row():
+                speaker_dropdown = gr.Dropdown(choices=speaker_names, value=default_speaker, label="Speaker")
+                style_dropdown = gr.Dropdown(choices=initial_styles, value=default_style_choice, label="Style")
+                speaker_dropdown.change(
+                    lambda name: gr.update(
+                        choices=(choices := style_choices(name)),
+                        value=choices[0] if choices else None,
+                    ),
+                    inputs=[speaker_dropdown],
+                    outputs=[style_dropdown],
                 )
+    
+            with gr.Tabs():
+                with gr.TabItem("Talk"):
+                    talk_text = gr.Textbox(label="Text", lines=4)
+                    talk_sync = gr.Checkbox(label="Wait for completion", value=False)
+                    talk_button = gr.Button("Send Talk Request")
+                    talk_result = gr.Textbox(label="Result", interactive=False)
+                    talk_button.click(
+                        submit_talk,
+                        inputs=[talk_text, style_dropdown, talk_sync],
+                        outputs=talk_result,
+                    )
+    
+                with gr.TabItem("Present"):
+                    present_selected_state = gr.State(None)
+                    uploads_state = gr.State([])
+    
+                    with gr.Row():
+                        script_file = gr.File(label="Upload Script (.md, .txt)", file_types=[".md", ".txt"], type="filepath")
+                        ppt_file = gr.File(label="Upload PowerPoint (.pptx, .ppt)", file_types=[".pptx", ".ppt"], type="filepath")
+    
+                    with gr.Row():
+                        script_existing_dropdown = gr.Dropdown(label="Existing scripts", choices=[], value=None, interactive=True)
+                        ppt_existing_dropdown = gr.Dropdown(label="Existing PowerPoints", choices=[], value=None, interactive=True)
+    
+                    with gr.Row():
+                        refresh_uploads_button = gr.Button("Refresh uploads", variant="secondary")
+                        delete_script_button = gr.Button("Delete selected script", variant="stop")
+                        delete_ppt_button = gr.Button("Delete selected PowerPoint", variant="stop")
+    
+                    upload_feedback = gr.Markdown("")
+    
+                    wait_slider = gr.Slider(label="Slide delay (seconds)", minimum=0.0, maximum=5.0, value=1.0, step=0.1)
+                    timeout_slider = gr.Slider(label="Slide timeout (seconds)", minimum=30.0, maximum=600.0, value=300.0, step=10.0)
+                    present_button = gr.Button("Start Presentation")
+                    present_result = gr.Textbox(label="Result", interactive=False)
+    
+                    present_cards = gr.HTML("<div class='session-empty'>No active presentation sessions.</div>")
+                    present_session_dropdown = gr.Dropdown(label="Session", choices=[], value=None)
+                    present_status = gr.Markdown("No active presentation sessions.")
+                    present_event_log = gr.Textbox(label="Event Stream", lines=8, interactive=False)
+    
+                    present_button.click(
+                        submit_present,
+                        inputs=[
+                            style_dropdown,
+                            script_file,
+                            script_existing_dropdown,
+                            ppt_file,
+                            ppt_existing_dropdown,
+                            wait_slider,
+                            timeout_slider,
+                            uploads_state,
+                        ],
+                        outputs=[present_result, present_selected_state],
+                    ).then(
+                        refresh_present,
+                        inputs=[present_selected_state],
+                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                    ).then(
+                        refresh_upload_components,
+                        inputs=[script_existing_dropdown, ppt_existing_dropdown],
+                        outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+                    )
+    
+                    present_session_dropdown.change(
+                        refresh_present,
+                        inputs=[present_session_dropdown],
+                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                    )
+    
+                    refresh_timer = gr.Timer(value=2.0)
+                    refresh_timer.tick(
+                        refresh_present,
+                        inputs=[present_selected_state],
+                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                        queue=False,
+                        show_progress='hidden',
+                        trigger_mode='always_last',
+                    )
+    
+                    refresh_uploads_button.click(
+                        refresh_upload_components,
+                        inputs=[script_existing_dropdown, ppt_existing_dropdown],
+                        outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+                    )
+    
+                    delete_script_button.click(
+                        delete_upload_entry,
+                        inputs=[gr.State("script"), script_existing_dropdown, ppt_existing_dropdown],
+                        outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+                    )
+    
+                    delete_ppt_button.click(
+                        delete_upload_entry,
+                        inputs=[gr.State("ppt"), script_existing_dropdown, ppt_existing_dropdown],
+                        outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+                    )
+    
+                    check_stream_button = gr.Button("Check Event Stream", variant="secondary")
+                    check_stream_result = gr.Textbox(label="Stream Check Result", lines=2, interactive=False)
+                    check_stream_button.click(
+                        test_event_stream,
+                        outputs=check_stream_result,
+                    )
+    
+                    with gr.Row():
+                        pause_btn = gr.Button("Pause")
+                        resume_btn = gr.Button("Resume")
+                        stop_btn = gr.Button("Stop")
+                    command_feedback = gr.Textbox(label="Command Result", interactive=False)
+                    pause_btn.click(
+                        lambda session_id: send_command(controller_url, session_id, "pause"),
+                        inputs=[present_session_dropdown],
+                        outputs=command_feedback,
+                    )
+                    resume_btn.click(
+                        lambda session_id: send_command(controller_url, session_id, "resume"),
+                        inputs=[present_session_dropdown],
+                        outputs=command_feedback,
+                    )
+                    stop_btn.click(
+                        lambda session_id: send_command(controller_url, session_id, "stop"),
+                        inputs=[present_session_dropdown],
+                        outputs=command_feedback,
+                    )
+    
+                with gr.TabItem("Sessions"):
+                    sessions_output = gr.Textbox(label="Sessions", lines=10, interactive=False)
+                    refresh_button = gr.Button("Refresh")
+                    refresh_button.click(
+                        refresh_sessions_json,
+                        outputs=sessions_output,
+                    )
+    
+            demo.load(
+                watch_present_sessions,
+                inputs=[present_selected_state],
+                outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                queue=False,
+            )
+    
+            demo.load(
+                refresh_upload_components,
+                inputs=[gr.State(None), gr.State(None)],
+                outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+            )
+    
+        return demo
+    
+    
+    
+    if __name__ == "__main__":
+        ui_app = build_ui()
+        ui_app.launch(server_name="0.0.0.0", server_port=8000)
 
-            with gr.TabItem("Present"):
-                present_selected_state = gr.State(None)
-                script_file = gr.File(label="Script file (Markdown)", file_types=[".md", ".txt"], type="filepath")
-                ppt_file = gr.File(label="PowerPoint file (optional)", file_types=[".pptx", ".ppt"], type="filepath")
-                wait_slider = gr.Slider(label="Slide delay (seconds)", minimum=0.0, maximum=5.0, value=1.0, step=0.1)
-                timeout_slider = gr.Slider(label="Slide timeout (seconds)", minimum=30.0, maximum=600.0, value=300.0, step=10.0)
-                present_button = gr.Button("Start Presentation")
-                present_result = gr.Textbox(label="Result", interactive=False)
-
-                present_cards = gr.HTML("<div class='session-empty'>No active presentation sessions.</div>")
-                present_session_dropdown = gr.Dropdown(label="Session", choices=[], value=None)
-                present_status = gr.Markdown("No active presentation sessions.")
-                present_event_log = gr.Textbox(label="Event Stream", lines=8, interactive=False)
-
-                present_button.click(
-                    submit_present,
-                    inputs=[style_dropdown, script_file, ppt_file, wait_slider, timeout_slider],
-                    outputs=[present_result, present_selected_state],
-                ).then(
-                    refresh_present,
-                    inputs=[present_selected_state],
-                    outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
-                )
-
-                present_session_dropdown.change(
-                    refresh_present,
-                    inputs=[present_session_dropdown],
-                    outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
-                )
-
-                refresh_timer = gr.Timer(value=2.0)
-                refresh_timer.tick(
-                    refresh_present,
-                    inputs=[present_selected_state],
-                    outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
-                    queue=False,
-                    show_progress='hidden',
-                    trigger_mode='always_last',
-                )
-
-                check_stream_button = gr.Button("Check Event Stream", variant="secondary")
-                check_stream_result = gr.Textbox(label="Stream Check Result", lines=2, interactive=False)
-                check_stream_button.click(
-                    test_event_stream,
-                    outputs=check_stream_result,
-                )
-
-                with gr.Row():
-                    pause_btn = gr.Button("Pause")
-                    resume_btn = gr.Button("Resume")
-                    stop_btn = gr.Button("Stop")
-                command_feedback = gr.Textbox(label="Command Result", interactive=False)
-                pause_btn.click(
-                    lambda session_id: send_command(controller_url, session_id, "pause"),
-                    inputs=[present_session_dropdown],
-                    outputs=command_feedback,
-                )
-                resume_btn.click(
-                    lambda session_id: send_command(controller_url, session_id, "resume"),
-                    inputs=[present_session_dropdown],
-                    outputs=command_feedback,
-                )
-                stop_btn.click(
-                    lambda session_id: send_command(controller_url, session_id, "stop"),
-                    inputs=[present_session_dropdown],
-                    outputs=command_feedback,
-                )
-
-            with gr.TabItem("Sessions"):
-                sessions_output = gr.Textbox(label="Sessions", lines=10, interactive=False)
-                refresh_button = gr.Button("Refresh")
-                refresh_button.click(
-                    refresh_sessions_json,
-                    outputs=sessions_output,
-                )
-
-        demo.load(
-            watch_present_sessions,
-            inputs=[present_selected_state],
-            outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
-            queue=False,
-        )
-
-    return demo
-
-
-
-if __name__ == "__main__":
-    ui_app = build_ui()
-    ui_app.launch(server_name="0.0.0.0", server_port=8000)

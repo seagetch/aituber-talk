@@ -1,4 +1,4 @@
-﻿"""API surface for the controller FastAPI app."""
+"""API surface for the controller FastAPI app."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import queue
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
@@ -40,15 +40,40 @@ def attach_routes(app: FastAPI, controller) -> None:
     async def list_modes() -> Dict[str, Any]:
         return {"modes": list(controller.registry.list_modes().values())}
 
+
     @router.post("/files")
     async def upload_file(file: UploadFile = File(...)) -> Dict[str, Any]:
         if not file.filename:
             raise HTTPException(status_code=400, detail="Filename is required")
-        suffix = Path(file.filename).suffix
-        dest = controller.upload_dir / f"{uuid.uuid4().hex}{suffix}"
+        safe_name = Path(file.filename).name
+        dest = controller.upload_dir / safe_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with dest.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        return {"path": str(dest), "filename": file.filename}
+        return {"path": str(dest), "filename": safe_name}
+
+    @router.get("/files")
+    async def list_files() -> Dict[str, Any]:
+        entries: List[Dict[str, Any]] = []
+        for item in sorted(controller.upload_dir.iterdir(), key=lambda p: p.name.lower()):
+            if not item.is_file():
+                continue
+            stat = item.stat()
+            entries.append({"name": item.name, "path": str(item.resolve()), "size": stat.st_size, "modified_at": stat.st_mtime})
+        return {"files": entries}
+
+    @router.delete("/files/{filename}")
+    async def delete_file(filename: str) -> Dict[str, Any]:
+        safe_name = Path(filename).name
+        target = controller.upload_dir / safe_name
+        try:
+            target.resolve().relative_to(controller.upload_dir.resolve())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid filename") from exc
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
+        target.unlink()
+        return {"deleted": safe_name}
 
     @router.post("/sessions")
     async def create_session(req: SessionCreateRequest) -> Dict[str, Any]:
@@ -141,4 +166,5 @@ def attach_routes(app: FastAPI, controller) -> None:
 
 
 __all__ = ["attach_routes", "SessionCreateRequest", "SessionCommandRequest"]
+
 
