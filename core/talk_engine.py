@@ -49,6 +49,7 @@ from src.utils.init_path import init_path  # type: ignore  # noqa: E402
 # Logging setup shared across processes
 # =============================================================================
 from logging.handlers import QueueHandler, QueueListener
+import atexit
 
 _log_queue: MPQueue = MPQueue()
 _console_handler = logging.StreamHandler()
@@ -66,6 +67,12 @@ _root_logger.addHandler(_console_handler)
 _listener = QueueListener(_log_queue, _console_handler)
 if not _listener._thread:  # Listener may already run when re-imported
     _listener.start()
+
+def _shutdown_log_listener() -> None:
+    _listener.stop()
+
+atexit.register(_shutdown_log_listener)
+
 
 logger = logging.getLogger("talk_engine")
 

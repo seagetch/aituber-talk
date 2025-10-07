@@ -152,7 +152,7 @@ def main() -> None:
 
     # Shutdown controller
     server.should_exit = True
-    server_thread.join(timeout=5)
+    server_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

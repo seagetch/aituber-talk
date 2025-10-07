@@ -134,10 +134,13 @@ class EventStreamListener(QThread):
     def run(self):
         self.newEvent.emit("__log__", {"message": "Starting event stream listener..."})
         for event_name, payload in _iter_controller_events(self.controller_url, self._stop_event):
+            if self._stop_event.is_set():
+                break
             self.newEvent.emit(event_name, payload)
-        self.newEvent.emit("__log__", {"message": "Event stream listener stopped."})
+        # Final log message is omitted to prevent errors during shutdown.
 
     def stop(self):
+        """Sets an event to gracefully stop the thread."""
         self.newEvent.emit("__log__", {"message": "Stopping event stream listener..."})
         self._stop_event.set()
 
@@ -215,11 +218,10 @@ class MainWindow(QMainWindow):
         self.refresh_timer.start(5000)
 
     def closeEvent(self, event):
-        """Ensure background threads are stopped and trigger app exit."""
+        """Signal background threads to stop and trigger app exit."""
         self.refresh_timer.stop()
-        self.event_listener.stop()
-        self.event_listener.wait(2)  # Wait a max of 2 seconds for the thread to finish
-        QApplication.instance().quit()  # Tell the event loop to exit
+        self.event_listener.stop()  # Set the stop flag
+        QApplication.instance().quit()  # Exit the event loop immediately
         super().closeEvent(event)
 
     def init_talk_tab(self):

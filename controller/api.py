@@ -151,7 +151,13 @@ def attach_routes(app: FastAPI, controller) -> None:
                 while True:
                     if await request.is_disconnected():
                         break
-                    item = await loop.run_in_executor(None, _await_event)
+                    try:
+                        item = await loop.run_in_executor(None, _await_event)
+                    except RuntimeError as e:
+                        if "cannot schedule new futures after shutdown" in str(e):
+                            break
+                        raise
+
                     if item is None:
                         continue
                     event_type, payload = item

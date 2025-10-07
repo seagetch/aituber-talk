@@ -37,9 +37,15 @@ class ControllerApp:
         self.upload_dir = Path(upload_dir or Path("uploads")).resolve()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.fastapi = FastAPI(title="AITuber Controller", version="0.1.0")
+        self.fastapi.add_event_handler("shutdown", self.shutdown_engine)
         self._mode_cache: Dict[str, Mode] = {}
         self._register_builtin_modes()
         attach_routes(self.fastapi, self)
+
+    def shutdown_engine(self) -> None:
+        """Shuts down the talk engine."""
+        self.engine.shutdown()
+
 
     # ------------------------------------------------------------------
     def _register_builtin_modes(self) -> None:
