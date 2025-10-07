@@ -23,13 +23,14 @@ from ui.web.app import build_ui
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch the AITuber desktop suite")
+    parser.add_argument("--ui", default="pyqt", choices=["pyqt", "web"], help="Specify the UI to use (pyqt or web)")
     parser.add_argument("--controller-host", default="127.0.0.1", help="Controller bind host")
     parser.add_argument("--controller-port", type=int, default=8001, help="Controller bind port")
     parser.add_argument("--ui-host", default="127.0.0.1", help="UI bind host")
     parser.add_argument("--device", default="auto", help="PyTorch device (auto, cpu, cuda, cuda:0, mps, etc.)")
     parser.add_argument("--list-devices", action="store_true", help="List detected PyTorch devices and exit")
     parser.add_argument("--ui-port", type=int, default=8000, help="UI bind port")
-    parser.add_argument("--open-browser", action="store_true", help="Open browser on UI start")
+    parser.add_argument("--open-browser", action="store_true", help="Open browser on UI start (web UI only)")
     parser.add_argument("--log-level", default="info", help="uvicorn log level for the controller")
     return parser.parse_args()
 
@@ -102,39 +103,56 @@ def main() -> None:
     engine_config = TalkEngineConfig(device=device_choice)
 
     server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level, engine_config)
-    ui = build_ui(controller_url=controller_url)
-    try:
-        ui.launch(
-            server_name=args.ui_host,
-            server_port=args.ui_port,
-            inbrowser=args.open_browser,
-            share=False,
-            prevent_thread_lock=True,
-        )
-    except OSError as exc:
-        server.should_exit = True
-        server_thread.join(timeout=5)
-        raise RuntimeError(
-            f"UI failed to start on {args.ui_host}:{args.ui_port}: {exc}. Try specifying a different --ui-port."
-        ) from exc
-
+    
     print("AITuber Desktop Suite running.")
     print(f"  Controller API: {controller_url}")
-    print(f"  UI: http://{args.ui_host}:{args.ui_port}/")
-    print("Press Ctrl+C to stop.")
 
-    try:
-        while server_thread.is_alive():
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    finally:
-        server.should_exit = True
+    if args.ui == "web":
+        from ui.web.app import build_ui
+        ui = build_ui(controller_url=controller_url)
         try:
-            ui.close()
-        except Exception:
-            pass
-        server_thread.join(timeout=5)
+            ui.launch(
+                server_name=args.ui_host,
+                server_port=args.ui_port,
+                inbrowser=args.open_browser,
+                share=False,
+                prevent_thread_lock=True,
+            )
+        except OSError as exc:
+            server.should_exit = True
+            server_thread.join(timeout=5)
+            raise RuntimeError(
+                f"UI failed to start on {args.ui_host}:{args.ui_port}: {exc}. Try specifying a different --ui-port."
+            ) from exc
+        
+        print(f"  UI: http://{args.ui_host}:{args.ui_port}/")
+        print("Press Ctrl+C to stop.")
+
+        try:
+            while server_thread.is_alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+        finally:
+            try:
+                ui.close()
+            except Exception:
+                pass
+    
+    else: # pyqt
+        from ui.pyqt.app import MainWindow
+        from PyQt6.QtWidgets import QApplication
+
+        print(f"  UI: PyQt")
+        app = QApplication(sys.argv)
+        main_window = MainWindow()
+        main_window.show()
+        app.exec()
+        print("\nShutting down...")
+
+    # Shutdown controller
+    server.should_exit = True
+    server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
@@ -143,4 +161,3 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         print(f"Failed to launch suite: {exc}", file=sys.stderr)
         sys.exit(1)
-
