@@ -36,11 +36,11 @@ function Install-PyTorch {
         return
     }
 
-    Write-Info "Installing PyTorch (channel: $TorchChannel)"
-    $extraIndex = "https://download.pytorch.org/whl/$TorchChannel"
-    & $PythonExe -m pip install --upgrade torch torchvision torchaudio --extra-index-url $extraIndex
+    Write-Info "Installing PyTorch (nightly channel: $TorchChannel)"
+    $nightlyIndex = "https://download.pytorch.org/whl/nightly/$TorchChannel"
+    & $PythonExe -m pip install --upgrade --pre torch torchvision torchaudio --index-url $nightlyIndex --extra-index-url https://pypi.org/simple
     if ($LASTEXITCODE -ne 0) {
-        Write-Info "CUDA installation failed; falling back to CPU build"
+        Write-Info "CUDA nightly installation failed; falling back to CPU build"
         & $PythonExe -m pip install --upgrade torch torchvision torchaudio
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to install PyTorch packages"

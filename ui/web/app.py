@@ -1,4 +1,4 @@
-"""Gradio UI targeting the controller service with mode-specific controls and live updates."""
+﻿"""Gradio UI targeting the controller service with mode-specific controls and live updates."""
 
 from __future__ import annotations
 
@@ -296,188 +296,189 @@ def format_present_status(detail: Dict[str, Any]) -> str:
 
 def build_ui(
     controller_url: str = DEFAULT_CONTROLLER_URL,
-    speaker_url: str = DEFAULT_SPEAKER_URL,
-) -> gr.Blocks:
-    speakers = fetch_speakers(speaker_url)
-    if not speakers:
-        speakers = [{"name": "Default", "styles": [{"id": 888753760, "name": "Default"}]}]
-    speaker_names = [sp.get("name", f"Speaker {idx}") for idx, sp in enumerate(speakers)]
-    default_speaker = speaker_names[0]
+    speaker_url: str = DEFAULT_SPEAKER_URL):
+    result = gr.Blocks()
+    with result:
+        speakers = fetch_speakers(speaker_url)
+        if not speakers:
+            speakers = [{"name": "Default", "styles": [{"id": 888753760, "name": "Default"}]}]
+        speaker_names = [sp.get("name", f"Speaker {idx}") for idx, sp in enumerate(speakers)]
+        default_speaker = speaker_names[0]
 
-    def style_choices(name: str) -> List[str]:
-        for sp in speakers:
-            if sp.get("name") == name:
-                return [f"{style.get('name', 'Style')} ({style.get('id')})" for style in sp.get('styles', [])]
-        return []
+        def style_choices(name: str) -> List[str]:
+            for sp in speakers:
+                if sp.get("name") == name:
+                    return [f"{style.get('name', 'Style')} ({style.get('id')})" for style in sp.get('styles', [])]
+            return []
 
-    initial_styles = style_choices(default_speaker)
-    default_style_choice = initial_styles[0] if initial_styles else f"Default ({speakers[0].get('styles', [{}])[0].get('id', 888753760)})"
+        initial_styles = style_choices(default_speaker)
+        default_style_choice = initial_styles[0] if initial_styles else f"Default ({speakers[0].get('styles', [{}])[0].get('id', 888753760)})"
 
-    present_selection: Dict[str, Optional[str]] = {"id": None}
-    selection_lock = threading.Lock()
-    event_log: deque[str] = deque(maxlen=100)
-    slide_event_tracker: Dict[str, int] = {}
-    status_event_tracker: Dict[str, str] = {}
-    snapshot_cache: Dict[str, Dict[str, Any]] = {}
+        present_selection: Dict[str, Optional[str]] = {"id": None}
+        selection_lock = threading.Lock()
+        event_log: deque[str] = deque(maxlen=100)
+        slide_event_tracker: Dict[str, int] = {}
+        status_event_tracker: Dict[str, str] = {}
+        snapshot_cache: Dict[str, Dict[str, Any]] = {}
 
-    def parse_style(choice: Optional[str]) -> int:
-        if not choice:
-            return speakers[0].get("styles", [{}])[0].get("id", 888753760)
-        try:
-            return int(choice.split("(")[-1].strip(")"))
-        except Exception:
-            return speakers[0].get("styles", [{}])[0].get("id", 888753760)
+        def parse_style(choice: Optional[str]) -> int:
+            if not choice:
+                return speakers[0].get("styles", [{}])[0].get("id", 888753760)
+            try:
+                return int(choice.split("(")[-1].strip(")"))
+            except Exception:
+                return speakers[0].get("styles", [{}])[0].get("id", 888753760)
 
-    def submit_talk(text: str, style_choice: Optional[str], sync: bool) -> str:
-        if not text:
-            return "Please enter text"
-        style_id = parse_style(style_choice)
-        payload = {
-            "mode": "talk",
-            "payload": {
-                "text": text,
-                "style_id": style_id,
-                "sync": sync,
-            },
-        }
-        resp = create_session(controller_url, payload)
-        if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
-            return resp["error"]
-        return json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
+        def submit_talk(text: str, style_choice: Optional[str], sync: bool) -> str:
+            if not text:
+                return "Please enter text"
+            style_id = parse_style(style_choice)
+            payload = {
+                "mode": "talk",
+                "payload": {
+                    "text": text,
+                    "style_id": style_id,
+                    "sync": sync,
+                },
+            }
+            resp = create_session(controller_url, payload)
+            if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
+                return resp["error"]
+            return json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
 
 
-    def submit_present(
-        style_choice: Optional[str],
-        script_upload: Optional[str],
-        script_choice: Optional[str],
-        ppt_upload: Optional[str],
-        ppt_choice: Optional[str],
-        wait_seconds: float,
-        timeout_seconds: float,
-        uploads_cache: Optional[List[Dict[str, Any]]],
-    ) -> Tuple[str, Optional[str]]:
-        uploads = uploads_cache or []
-        files_by_name = {entry.get("name"): entry for entry in uploads if isinstance(entry, dict)}
-    
-        def resolve_existing(name: Optional[str]) -> Optional[str]:
-            if not name:
+        def submit_present(
+            style_choice: Optional[str],
+            script_upload: Optional[str],
+            script_choice: Optional[str],
+            ppt_upload: Optional[str],
+            ppt_choice: Optional[str],
+            wait_seconds: float,
+            timeout_seconds: float,
+            uploads_cache: Optional[List[Dict[str, Any]]],
+        ) -> Tuple[str, Optional[str]]:
+            uploads = uploads_cache or []
+            files_by_name = {entry.get("name"): entry for entry in uploads if isinstance(entry, dict)}
+        
+            def resolve_existing(name: Optional[str]) -> Optional[str]:
+                if not name:
+                    return None
+                entry = files_by_name.get(name)
+                if entry:
+                    return entry.get("path")
                 return None
-            entry = files_by_name.get(name)
-            if entry:
-                return entry.get("path")
-            return None
-    
-        style_id = parse_style(style_choice)
-    
-        script_server_path = resolve_existing(script_choice)
-        if not script_server_path and script_upload:
-            script_server_path, err = upload_asset(controller_url, script_upload)
-            if err:
-                return err, None
-            script_choice = Path(script_server_path or "").name if script_server_path else script_choice
-        if not script_server_path:
-            return "Please provide or select a script (.md or .txt)", None
-    
-        ppt_server_path = resolve_existing(ppt_choice)
-        if not ppt_server_path and ppt_upload:
-            ppt_server_path, err = upload_asset(controller_url, ppt_upload)
-            if err:
-                return err, None
-            ppt_choice = Path(ppt_server_path or "").name if ppt_server_path else ppt_choice
-    
-        payload: Dict[str, Any] = {
-            "mode": "present",
-            "payload": {
-                "script_path": script_server_path,
-                "wait": float(wait_seconds),
-                "timeout": float(timeout_seconds),
-                "style_id": style_id,
-            },
-        }
-        if ppt_server_path:
-            payload["payload"]["ppt_path"] = ppt_server_path
-    
-        resp = create_session(controller_url, payload)
-        if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
-            return resp["error"], None
-        session_id = resp.get("session", {}).get("id") if isinstance(resp, dict) else None
-        message = json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
-        return message, session_id
-    
+        
+            style_id = parse_style(style_choice)
+        
+            script_server_path = resolve_existing(script_choice)
+            if not script_server_path and script_upload:
+                script_server_path, err = upload_asset(controller_url, script_upload)
+                if err:
+                    return err, None
+                script_choice = Path(script_server_path or "").name if script_server_path else script_choice
+            if not script_server_path:
+                return "Please provide or select a script (.md or .txt)", None
+        
+            ppt_server_path = resolve_existing(ppt_choice)
+            if not ppt_server_path and ppt_upload:
+                ppt_server_path, err = upload_asset(controller_url, ppt_upload)
+                if err:
+                    return err, None
+                ppt_choice = Path(ppt_server_path or "").name if ppt_server_path else ppt_choice
+        
+            payload: Dict[str, Any] = {
+                "mode": "present",
+                "payload": {
+                    "script_path": script_server_path,
+                    "wait": float(wait_seconds),
+                    "timeout": float(timeout_seconds),
+                    "style_id": style_id,
+                },
+            }
+            if ppt_server_path:
+                payload["payload"]["ppt_path"] = ppt_server_path
+        
+            resp = create_session(controller_url, payload)
+            if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
+                return resp["error"], None
+            session_id = resp.get("session", {}).get("id") if isinstance(resp, dict) else None
+            message = json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
+            return message, session_id
+        
         def get_event_log_text() -> str:
             return "\n".join(event_log) if event_log else "No events yet."
-    
-    def load_upload_choices() -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]], List[Tuple[str, str]]]:
-        files = list_uploaded_files(controller_url)
-        script_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".md", ".txt")]
-        ppt_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".ppt", ".pptx")]
-    
-        def build_choices(items: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
-            choices: List[Tuple[str, str]] = []
-            for item in items:
-                name = item.get("name")
-                if not name:
-                    continue
-                size = item.get("size", 0)
-                label = f"{name} ({_human_size(int(size))})"
-                choices.append((label, name))
-            return choices
-    
-        return files, build_choices(script_entries), build_choices(ppt_entries)
-    
-    def refresh_upload_components(current_script: Optional[str], current_ppt: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
-        files, script_choices, ppt_choices = load_upload_choices()
-        script_values = {value for _, value in script_choices}
-        ppt_values = {value for _, value in ppt_choices}
-        script_value = current_script if current_script in script_values else None
-        ppt_value = current_ppt if current_ppt in ppt_values else None
-        return (
-            gr.update(choices=script_choices, value=script_value),
-            gr.update(choices=ppt_choices, value=ppt_value),
-            files,
-            "",
-        )
-    
-    def delete_upload_entry(target: str, script_selected: Optional[str], ppt_selected: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
-        filename = script_selected if target == "script" else ppt_selected
-        if not filename:
+        
+        def load_upload_choices() -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]], List[Tuple[str, str]]]:
+            files = list_uploaded_files(controller_url)
+            script_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".md", ".txt")]
+            ppt_entries = [entry for entry in files if Path(entry.get("name", "")).suffix.lower() in (".ppt", ".pptx")]
+        
+            def build_choices(items: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+                choices: List[Tuple[str, str]] = []
+                for item in items:
+                    name = item.get("name")
+                    if not name:
+                        continue
+                    size = item.get("size", 0)
+                    label = f"{name} ({_human_size(int(size))})"
+                    choices.append((label, name))
+                return choices
+        
+            return files, build_choices(script_entries), build_choices(ppt_entries)
+        
+        def refresh_upload_components(current_script: Optional[str], current_ppt: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
             files, script_choices, ppt_choices = load_upload_choices()
             script_values = {value for _, value in script_choices}
             ppt_values = {value for _, value in ppt_choices}
-            script_value = script_selected if script_selected in script_values else None
-            ppt_value = ppt_selected if ppt_selected in ppt_values else None
+            script_value = current_script if current_script in script_values else None
+            ppt_value = current_ppt if current_ppt in ppt_values else None
             return (
                 gr.update(choices=script_choices, value=script_value),
                 gr.update(choices=ppt_choices, value=ppt_value),
                 files,
-                "Select a file to delete first.",
+                "",
             )
-        error = delete_uploaded_file(controller_url, filename)
-        if error:
+        
+        def delete_upload_entry(target: str, script_selected: Optional[str], ppt_selected: Optional[str]) -> Tuple[gr.Dropdown, gr.Dropdown, List[Dict[str, Any]], str]:
+            filename = script_selected if target == "script" else ppt_selected
+            if not filename:
+                files, script_choices, ppt_choices = load_upload_choices()
+                script_values = {value for _, value in script_choices}
+                ppt_values = {value for _, value in ppt_choices}
+                script_value = script_selected if script_selected in script_values else None
+                ppt_value = ppt_selected if ppt_selected in ppt_values else None
+                return (
+                    gr.update(choices=script_choices, value=script_value),
+                    gr.update(choices=ppt_choices, value=ppt_value),
+                    files,
+                    "Select a file to delete first.",
+                )
+            error = delete_uploaded_file(controller_url, filename)
+            if error:
+                files, script_choices, ppt_choices = load_upload_choices()
+                script_values = {value for _, value in script_choices}
+                ppt_values = {value for _, value in ppt_choices}
+                script_value = script_selected if script_selected in script_values else None
+                ppt_value = ppt_selected if ppt_selected in ppt_values else None
+                return (
+                    gr.update(choices=script_choices, value=script_value),
+                    gr.update(choices=ppt_choices, value=ppt_value),
+                    files,
+                    error,
+                )
             files, script_choices, ppt_choices = load_upload_choices()
             script_values = {value for _, value in script_choices}
             ppt_values = {value for _, value in ppt_choices}
-            script_value = script_selected if script_selected in script_values else None
-            ppt_value = ppt_selected if ppt_selected in ppt_values else None
+            script_value = script_selected if (target != "script" and script_selected in script_values) else None
+            ppt_value = ppt_selected if (target != "ppt" and ppt_selected in ppt_values) else None
+            message = f"Deleted {filename}."
             return (
                 gr.update(choices=script_choices, value=script_value),
                 gr.update(choices=ppt_choices, value=ppt_value),
                 files,
-                error,
+                message,
             )
-        files, script_choices, ppt_choices = load_upload_choices()
-        script_values = {value for _, value in script_choices}
-        ppt_values = {value for _, value in ppt_choices}
-        script_value = script_selected if (target != "script" and script_selected in script_values) else None
-        ppt_value = ppt_selected if (target != "ppt" and ppt_selected in ppt_values) else None
-        message = f"Deleted {filename}."
-        return (
-            gr.update(choices=script_choices, value=script_value),
-            gr.update(choices=ppt_choices, value=ppt_value),
-            files,
-            message,
-        )
-    
+        
         def append_log(event_name: str, payload: Optional[Dict[str, Any]] = None) -> None:
             timestamp = time.strftime("%H:%M:%S")
             summary: Optional[str] = None
@@ -534,9 +535,9 @@ def build_ui(
                         status_event_tracker[session_ref] = status_value
                 if event_name in {"presentation_slide_progress"} and isinstance(payload, dict):
                     slide_event_tracker[session_ref] = payload.get('slide') or slide_event_tracker.get(session_ref, 0)
-    
-    
-    
+
+
+
         def track_progress(session_id: Optional[str], detail: Dict[str, Any]) -> None:
             if not session_id:
                 return
@@ -580,7 +581,7 @@ def build_ui(
                 'slide': current_slide,
                 'status': status_label,
             }
-    
+
         def present_snapshot(selected_session: Optional[str]) -> Tuple[str, Any, str, Optional[str]]:
             sessions = list_present_sessions(controller_url)
             detail_map: Dict[str, Dict[str, Any]] = {}
@@ -627,23 +628,23 @@ def build_ui(
             if selected_session:
                 track_progress(selected_session, detail_map[selected_session])
             return cards_html, dropdown, status_text, selected_session
-    
+
         def refresh_present(selected_session: Optional[str]):
             cards_html, dropdown, status_text, selected_session = present_snapshot(selected_session)
             return cards_html, dropdown, status_text, get_event_log_text(), selected_session
-    
+
         def refresh_sessions_json() -> str:
             sessions = list_sessions(controller_url)
             return json.dumps(sessions, ensure_ascii=False, indent=2) or "[]"
-    
+
         def watch_present_sessions(initial_selection: Optional[str]):
             selected = initial_selection
             cards_html, dropdown, status_text, selected = present_snapshot(selected)
             yield cards_html, dropdown, status_text, get_event_log_text(), selected
-    
+
             events_q: Queue[Tuple[str, Dict[str, Any]]] = Queue()
             stop_event = threading.Event()
-    
+
             def pump_events() -> None:
                 try:
                     for event in _iter_controller_events(controller_url, stop_event):
@@ -652,14 +653,14 @@ def build_ui(
                     events_q.put(("__error__", {"error": str(exc)}))
                 finally:
                     events_q.put(("__closed__", {}))
-    
+
             listener = threading.Thread(
                 target=pump_events,
                 name="present-event-listener",
                 daemon=True,
             )
             listener.start()
-    
+
             last_emit = time.monotonic()
             try:
                 while True:
@@ -695,7 +696,7 @@ def build_ui(
             finally:
                 stop_event.set()
                 listener.join(timeout=1.0)
-    
+        
         def test_event_stream() -> str:
             try:
                 with requests.get(
@@ -716,7 +717,7 @@ def build_ui(
                 return "Connected, but no events arrived before the timeout."
             except Exception as exc:
                 return f"Error: {exc}"
-    
+        
         demo = gr.Blocks(title="AITuber Controller UI")
         with demo:
             gr.HTML(STYLE)
@@ -724,7 +725,7 @@ def build_ui(
             gr.Markdown(
                 "Upload presentation assets and send requests to the controller service. Talk and Present modes expose their own controls below."
             )
-    
+
             with gr.Row():
                 speaker_dropdown = gr.Dropdown(choices=speaker_names, value=default_speaker, label="Speaker")
                 style_dropdown = gr.Dropdown(choices=initial_styles, value=default_style_choice, label="Style")
@@ -736,7 +737,7 @@ def build_ui(
                     inputs=[speaker_dropdown],
                     outputs=[style_dropdown],
                 )
-    
+
             with gr.Tabs():
                 with gr.TabItem("Talk"):
                     talk_text = gr.Textbox(label="Text", lines=4)
@@ -748,36 +749,36 @@ def build_ui(
                         inputs=[talk_text, style_dropdown, talk_sync],
                         outputs=talk_result,
                     )
-    
+
                 with gr.TabItem("Present"):
                     present_selected_state = gr.State(None)
                     uploads_state = gr.State([])
-    
+
                     with gr.Row():
                         script_file = gr.File(label="Upload Script (.md, .txt)", file_types=[".md", ".txt"], type="filepath")
                         ppt_file = gr.File(label="Upload PowerPoint (.pptx, .ppt)", file_types=[".pptx", ".ppt"], type="filepath")
-    
+
                     with gr.Row():
                         script_existing_dropdown = gr.Dropdown(label="Existing scripts", choices=[], value=None, interactive=True)
                         ppt_existing_dropdown = gr.Dropdown(label="Existing PowerPoints", choices=[], value=None, interactive=True)
-    
+
                     with gr.Row():
                         refresh_uploads_button = gr.Button("Refresh uploads", variant="secondary")
                         delete_script_button = gr.Button("Delete selected script", variant="stop")
                         delete_ppt_button = gr.Button("Delete selected PowerPoint", variant="stop")
-    
+
                     upload_feedback = gr.Markdown("")
-    
+
                     wait_slider = gr.Slider(label="Slide delay (seconds)", minimum=0.0, maximum=5.0, value=1.0, step=0.1)
                     timeout_slider = gr.Slider(label="Slide timeout (seconds)", minimum=30.0, maximum=600.0, value=300.0, step=10.0)
                     present_button = gr.Button("Start Presentation")
                     present_result = gr.Textbox(label="Result", interactive=False)
-    
+
                     present_cards = gr.HTML("<div class='session-empty'>No active presentation sessions.</div>")
                     present_session_dropdown = gr.Dropdown(label="Session", choices=[], value=None)
                     present_status = gr.Markdown("No active presentation sessions.")
                     present_event_log = gr.Textbox(label="Event Stream", lines=8, interactive=False)
-    
+
                     present_button.click(
                         submit_present,
                         inputs=[
@@ -800,13 +801,13 @@ def build_ui(
                         inputs=[script_existing_dropdown, ppt_existing_dropdown],
                         outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
                     )
-    
+
                     present_session_dropdown.change(
                         refresh_present,
                         inputs=[present_session_dropdown],
                         outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
                     )
-    
+
                     refresh_timer = gr.Timer(value=2.0)
                     refresh_timer.tick(
                         refresh_present,
@@ -816,32 +817,32 @@ def build_ui(
                         show_progress='hidden',
                         trigger_mode='always_last',
                     )
-    
+
                     refresh_uploads_button.click(
                         refresh_upload_components,
                         inputs=[script_existing_dropdown, ppt_existing_dropdown],
                         outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
                     )
-    
+
                     delete_script_button.click(
                         delete_upload_entry,
                         inputs=[gr.State("script"), script_existing_dropdown, ppt_existing_dropdown],
                         outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
                     )
-    
+
                     delete_ppt_button.click(
                         delete_upload_entry,
                         inputs=[gr.State("ppt"), script_existing_dropdown, ppt_existing_dropdown],
                         outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
                     )
-    
+
                     check_stream_button = gr.Button("Check Event Stream", variant="secondary")
                     check_stream_result = gr.Textbox(label="Stream Check Result", lines=2, interactive=False)
                     check_stream_button.click(
                         test_event_stream,
                         outputs=check_stream_result,
                     )
-    
+
                     with gr.Row():
                         pause_btn = gr.Button("Pause")
                         resume_btn = gr.Button("Resume")
@@ -862,7 +863,7 @@ def build_ui(
                         inputs=[present_session_dropdown],
                         outputs=command_feedback,
                     )
-    
+
                 with gr.TabItem("Sessions"):
                     sessions_output = gr.Textbox(label="Sessions", lines=10, interactive=False)
                     refresh_button = gr.Button("Refresh")
@@ -870,21 +871,21 @@ def build_ui(
                         refresh_sessions_json,
                         outputs=sessions_output,
                     )
-    
-            demo.load(
-                watch_present_sessions,
-                inputs=[present_selected_state],
-                outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
-                queue=False,
-            )
-    
-            demo.load(
-                refresh_upload_components,
-                inputs=[gr.State(None), gr.State(None)],
-                outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
-            )
-    
-        return demo
+
+        demo.load(
+            watch_present_sessions,
+            inputs=[present_selected_state],
+            outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+            queue=False,
+        )
+
+        demo.load(
+            refresh_upload_components,
+            inputs=[gr.State(None), gr.State(None)],
+            outputs=[script_existing_dropdown, ppt_existing_dropdown, uploads_state, upload_feedback],
+        )
+
+    return result
     
     
     
