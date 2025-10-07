@@ -1,4 +1,4 @@
-﻿# Core runtime
+# Core runtime
 fastapi>=0.110
 uvicorn>=0.23
 requests>=2.31
@@ -11,6 +11,7 @@ mat73>=0.60
 
 # Controller UI
 gradio>=4.14
+PyQt6>=6.6
 
 # Windows presentation support
 pillow>=10.0
