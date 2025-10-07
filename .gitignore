@@ -1,0 +1,7 @@
+.venv
+__pycache__
+backup/
+**/__pycache__
+ppt_test
+uploads/
+SadTalker/
