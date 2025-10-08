@@ -864,6 +864,59 @@ def build_ui(
                         outputs=command_feedback,
                     )
 
+                with gr.TabItem("FaceTracker"):
+                    facetracker_session_id = gr.State(None)
+
+                    with gr.Row():
+                        ft_camera_index = gr.Number(label="Camera Index", value=0, precision=0)
+                        ft_osc_host = gr.Textbox(label="VMC Host", value="127.0.0.1")
+                        ft_osc_port = gr.Number(label="VMC Port", value=39540, precision=0)
+                    
+                    ft_flip_camera = gr.Checkbox(label="Flip Camera Horizontally", value=False)
+
+                    with gr.Row():
+                        ft_start_button = gr.Button("Start Tracking", variant="primary")
+                        ft_stop_button = gr.Button("Stop Tracking")
+
+                    ft_status = gr.Textbox(label="Status", interactive=False)
+
+                    def start_facetracker_web(cam_idx, host, port, flip_cam):
+                        payload = {
+                            "mode": "facetracker",
+                            "payload": {
+                                "camera_index": cam_idx,
+                                "osc_host": host,
+                                "osc_port": port,
+                                "flip_camera": flip_cam,
+                            },
+                        }
+                        resp = create_session(controller_url, payload)
+                        if "error" in resp:
+                            return resp["error"], None
+                        
+                        session_id = resp.get("session", {}).get("id")
+                        status_msg = f"Started session: {session_id}"
+                        return status_msg, session_id
+
+                    def stop_facetracker_web(session_id):
+                        if not session_id:
+                            return "No active session to stop.", None
+                        
+                        result = send_command(controller_url, session_id, "stop")
+                        return f"Stopped session {session_id}. Result: {result}", None
+
+                    ft_start_button.click(
+                        start_facetracker_web,
+                        inputs=[ft_camera_index, ft_osc_host, ft_osc_port, ft_flip_camera],
+                        outputs=[ft_status, facetracker_session_id],
+                    )
+
+                    ft_stop_button.click(
+                        stop_facetracker_web,
+                        inputs=[facetracker_session_id],
+                        outputs=[ft_status, facetracker_session_id],
+                    )
+
                 with gr.TabItem("Sessions"):
                     sessions_output = gr.Textbox(label="Sessions", lines=10, interactive=False)
                     refresh_button = gr.Button("Refresh")

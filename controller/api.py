@@ -79,6 +79,21 @@ def attach_routes(app: FastAPI, controller) -> None:
     async def create_session(req: SessionCreateRequest) -> Dict[str, Any]:
         if req.mode not in controller.registry.list_modes():
             raise HTTPException(status_code=404, detail=f"Mode '{req.mode}' not found")
+
+        # Stop any currently active sessions and wait for them to finish
+        active_sessions = [s for s in controller.sessions.list() if s.status not in {"completed", "stopped", "error"}]
+        if active_sessions:
+            loop = asyncio.get_running_loop()
+            for session_to_stop in active_sessions:
+                try:
+                    mode_to_stop = controller.get_mode(session_to_stop.mode)
+                    # Run the synchronous stop method in an executor to avoid blocking the event loop
+                    await loop.run_in_executor(None, mode_to_stop.stop, session_to_stop)
+                    controller.sessions.update_status(session_to_stop.id, "stopped")
+                except Exception as e:
+                    # Log error but don't prevent new session from starting
+                    print(f"[WARN] Failed to gracefully stop session {session_to_stop.id}: {e}")
+
         session = controller.sessions.create(
             req.mode,
             session_id=req.session_id,
