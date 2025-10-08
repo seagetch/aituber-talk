@@ -6,13 +6,14 @@ aituber-talkは、**テキストを入力するとAIアバターがその内容�
 本プロジェクトは
 - [aivisspeech](https://github.com/seagetch/aivisspeech)（テキスト→音声合成/TTS）
 - [SadTalker](https://github.com/OpenTalker/SadTalker)（音声＋画像→顔アニメーション生成）
+- [nijiexpose](https://github.com/nijigenerate/nijiexpose). (アバター表示プログラム）
 を統合し、テキスト入力から音声合成、リップシンク、表情生成までを一貫して自動化します。
 
 生成されたモーションはVMCプロトコルで外部のVRMアバターなどにリアルタイムで送信できます。
 
 **用途例:**
 - テキスト原稿から自動でAIアバターによるプレゼン動画を作成
-- デスクトップアプリやWeb UIでテキストを入力し、即座にVRMアバターを動かす
+- デスクトップアプリやWeb UIでテキストを入力し、即座にアバターを動かす
 - API経由で自動動画生成パイプラインを構築
 
 ---
@@ -44,7 +45,6 @@ flowchart TD
     end
 
     subgraph AITuber Talk Application
-        app_py["app.py --ui [pyqt|web]"]
         controller["Controller Service"]
         pyqt_ui["PyQt UI"]
         web_ui["Web UI (Gradio)"]
@@ -57,16 +57,12 @@ flowchart TD
 
     subgraph External Services
         aivisspeech["aivisspeech (TTS)"]
-        vmc_app["VRM/VMC Application"]
+        vmc_app["VMC Application (nijiexpose)"]
     end
 
     user_desktop --> pyqt_ui
     user_web --> web_ui
     camera --> controller
-
-    app_py --> controller
-    app_py --> pyqt_ui
-    app_py --> web_ui
 
     pyqt_ui -->|HTTP API| controller
     web_ui -->|HTTP API| controller
