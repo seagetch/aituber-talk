@@ -18,7 +18,7 @@ from PyQt6.QtCore import (
     QObject, QRunnable, QThreadPool, pyqtSignal,
     pyqtSlot, QThread, QTimer)
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QPushButton, QTabWidget, QTextEdit,
@@ -181,6 +181,7 @@ class MainWindow(QMainWindow):
         self.threadpool = QThreadPool()
         self.event_log_deque = deque(maxlen=200)
         self.speakers = []
+        self.facetracker_session_id: Optional[str] = None
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -198,14 +199,17 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.talk_tab = QWidget()
         self.present_tab = QWidget()
+        self.facetracker_tab = QWidget()
         self.sessions_tab = QWidget()
         self.tabs.addTab(self.talk_tab, "Talk")
         self.tabs.addTab(self.present_tab, "Present")
+        self.tabs.addTab(self.facetracker_tab, "FaceTracker")
         self.tabs.addTab(self.sessions_tab, "Sessions")
         self.layout.addWidget(self.tabs)
 
         self.init_talk_tab()
         self.init_present_tab()
+        self.init_facetracker_tab()
         self.init_sessions_tab()
         
         self.load_speakers()
@@ -327,6 +331,43 @@ class MainWindow(QMainWindow):
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         self.start_present_button.clicked.connect(self.submit_present)
+
+    def init_facetracker_tab(self):
+        """Set up the UI for the 'FaceTracker' tab."""
+        layout = QVBoxLayout(self.facetracker_tab)
+        form_layout = QFormLayout()
+
+        self.camera_index_spinbox = QSpinBox()
+        self.camera_index_spinbox.setRange(0, 10)
+        self.camera_index_spinbox.setValue(0)
+        form_layout.addRow("Camera Index:", self.camera_index_spinbox)
+
+        self.osc_host_edit = QLineEdit("127.0.0.1")
+        form_layout.addRow("VMC Host:", self.osc_host_edit)
+
+        self.osc_port_spinbox = QSpinBox()
+        self.osc_port_spinbox.setRange(1, 65535)
+        self.osc_port_spinbox.setValue(39540)
+        form_layout.addRow("VMC Port:", self.osc_port_spinbox)
+
+        self.flip_camera_checkbox = QCheckBox("Flip Camera Horizontally")
+        form_layout.addRow(self.flip_camera_checkbox)
+
+        layout.addLayout(form_layout)
+
+        buttons_layout = QHBoxLayout()
+        self.start_facetracker_button = QPushButton("Start Tracking")
+        self.stop_facetracker_button = QPushButton("Stop Tracking")
+        buttons_layout.addWidget(self.start_facetracker_button)
+        buttons_layout.addWidget(self.stop_facetracker_button)
+        layout.addLayout(buttons_layout)
+
+        self.facetracker_status_label = QLabel("Status: Not running")
+        layout.addWidget(self.facetracker_status_label)
+        layout.addStretch()
+
+        self.start_facetracker_button.clicked.connect(self.start_facetracker)
+        self.stop_facetracker_button.clicked.connect(self.stop_facetracker)
 
     def init_sessions_tab(self):
         layout = QVBoxLayout(self.sessions_tab)
@@ -542,6 +583,56 @@ class MainWindow(QMainWindow):
         worker.signals.result.connect(lambda res: self.command_feedback.setText(str(res)))
         worker.signals.error.connect(lambda err: self.command_feedback.setText(f"Error: {err}"))
         self.threadpool.start(worker)
+
+    @pyqtSlot()
+    def start_facetracker(self):
+        """Starts a new facetracker session."""
+        if self.facetracker_session_id:
+            self.facetracker_status_label.setText("Status: A session is already active. Stop it first.")
+            return
+
+        payload = {
+            "mode": "facetracker",
+            "payload": {
+                "camera_index": self.camera_index_spinbox.value(),
+                "osc_host": self.osc_host_edit.text(),
+                "osc_port": self.osc_port_spinbox.value(),
+                "flip_camera": self.flip_camera_checkbox.isChecked(),
+            },
+        }
+        
+        worker = Worker(create_session, DEFAULT_CONTROLLER_URL, payload)
+        worker.signals.result.connect(self.handle_facetracker_start_response)
+        worker.signals.error.connect(lambda err: self.facetracker_status_label.setText(f"Error: {err}"))
+        self.threadpool.start(worker)
+
+    def handle_facetracker_start_response(self, result: dict):
+        if "error" in result:
+            self.facetracker_status_label.setText(f"Error: {result['error']}")
+            return
+        
+        session_id = result.get("session", {}).get("id")
+        if session_id:
+            self.facetracker_session_id = session_id
+            self.facetracker_status_label.setText(f"Status: Running (Session: {session_id[:8]})")
+        else:
+            self.facetracker_status_label.setText("Error: Could not get session ID from response.")
+
+    @pyqtSlot()
+    def stop_facetracker(self):
+        """Stops the current facetracker session."""
+        if not self.facetracker_session_id:
+            self.facetracker_status_label.setText("Status: No active session to stop.")
+            return
+
+        worker = Worker(send_command, DEFAULT_CONTROLLER_URL, self.facetracker_session_id, "stop")
+        worker.signals.result.connect(self.handle_facetracker_stop_response)
+        worker.signals.error.connect(lambda err: self.facetracker_status_label.setText(f"Error: {err}"))
+        self.threadpool.start(worker)
+
+    def handle_facetracker_stop_response(self, result: str):
+        self.facetracker_status_label.setText("Status: Not running")
+        self.facetracker_session_id = None
 
 if __name__ == "__main__":
     try:

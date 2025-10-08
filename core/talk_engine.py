@@ -318,6 +318,7 @@ class TalkEngine:
         self._sock: Optional[SimpleUDPClient] = None
         self._pause_event = threading.Event()
         self._stop_event = threading.Event()
+        self._idle_enabled = threading.Event()
         self._current_session_id: Optional[str] = None
         self._state_lock = threading.Lock()
         self._threads: Dict[str, threading.Thread] = {}
@@ -346,6 +347,7 @@ class TalkEngine:
         self._sock = SimpleUDPClient(self.config.osc_host, self.config.osc_port)
         self._stop_event.clear()
         self._pause_event.clear()
+        self._idle_enabled.set()
 
         self._threads = {
             "producer": threading.Thread(target=self._text_producer_loop, name="TalkProducer", daemon=True),
@@ -455,6 +457,13 @@ class TalkEngine:
     def set_style(self, style_id: int) -> None:
         self._style_id = style_id
 
+    def set_idle(self, enabled: bool) -> None:
+        """Enable or disable the idle motion generator."""
+        if enabled:
+            self._idle_enabled.set()
+        else:
+            self._idle_enabled.clear()
+
     # ------------------------------------------------------------------
     # Worker loops
     # ------------------------------------------------------------------
@@ -511,6 +520,7 @@ class TalkEngine:
         if self._idle_queue is None:
             return
         while not self._stop_event.is_set():
+            self._idle_enabled.wait()
             if self._motion_queue is not None and not self._motion_queue.empty():
                 time.sleep(0.1)
                 continue

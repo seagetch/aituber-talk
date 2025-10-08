@@ -13,6 +13,7 @@ from controller.registry import ModeRegistry
 from controller.session import SessionManager
 from core.talk_engine import TalkEngine, TalkEngineConfig
 from plugins.base import Mode
+from plugins.facetracker import FaceTrackerMode
 from plugins.present import PresentMode
 from plugins.talk import TalkMode
 
@@ -119,6 +120,34 @@ class ControllerApp:
                         "maximum": 600.0,
                         "step": 10.0,
                         "default": 300.0,
+                    },
+                ],
+            },
+        )
+
+        self.registry.register(
+            "facetracker",
+            lambda **deps: FaceTrackerMode(engine=self.engine),
+            description="Run face tracking via nijitrack and send VMC data.",
+            metadata={
+                "form": [
+                    {
+                        "type": "number",
+                        "name": "camera_index",
+                        "label": "Camera Index",
+                        "default": 0,
+                    },
+                    {
+                        "type": "text",
+                        "name": "osc_host",
+                        "label": "VMC Host",
+                        "default": "127.0.0.1",
+                    },
+                    {
+                        "type": "number",
+                        "name": "osc_port",
+                        "label": "VMC Port",
+                        "default": 39540,
                     },
                 ],
             },
