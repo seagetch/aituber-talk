@@ -62,9 +62,6 @@ class FaceTrackerMode(Mode):
         if self._thread is not None and self._thread.is_alive():
             return {"status": "already_running", "session_id": session.id}
 
-        # Disable TalkEngine idle motion
-        self.engine.set_idle(False)
-
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._tracker_loop,
@@ -133,6 +130,9 @@ class FaceTrackerMode(Mode):
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open camera device {camera_index}.")
 
+            # Stop idle motion only when the tracker is fully ready
+            self.engine.set_idle(False)
+
             while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
@@ -172,6 +172,8 @@ class FaceTrackerMode(Mode):
             # In a real implementation, we would use the event bus to report this error.
             print(f"[FaceTracker-{session_id[:8]}] Error: {e}")
         finally:
+            # Ensure idle is re-enabled even if the loop fails
+            self.engine.set_idle(True)
             if cap:
                 cap.release()
             if landmarker:

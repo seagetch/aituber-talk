@@ -463,6 +463,13 @@ class TalkEngine:
             self._idle_enabled.set()
         else:
             self._idle_enabled.clear()
+            # Also clear any pending idle motions from the queue
+            if self._idle_queue is not None:
+                while not self._idle_queue.empty():
+                    try:
+                        self._idle_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
     # ------------------------------------------------------------------
     # Worker loops
@@ -574,9 +581,17 @@ class TalkEngine:
                         coeff_idle, duration = self._idle_queue.get(timeout=0.1)
                     except queue.Empty:
                         continue
+
+                    # Before starting to play, check if idle has been disabled
+                    if not self._idle_enabled.is_set():
+                        continue
+
                     frames = coeff_idle.shape[0]
                     dt = duration / frames if frames else 0.033
                     for idx in range(frames):
+                        # Check on each frame if idle has been disabled
+                        if not self._idle_enabled.is_set():
+                            break
                         if not self._motion_queue.empty():
                             break
                         while self._pause_event.is_set() and not self._stop_event.is_set():
