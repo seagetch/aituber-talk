@@ -1,6 +1,7 @@
 # aituber-talk
 
 aituber-talkは、**テキストを入力するとAIアバターがその内容を発話し、顔の動きやリップシンクを伴うモーションをVMCプロトコルで送信する**AIアバター生成パイプラインです。
+<img width="2001" height="1014" alt="image" src="https://github.com/user-attachments/assets/27de368c-686c-48c5-bd9a-4592300c22c8" />
 
 本プロジェクトは
 - [aivisspeech](https://github.com/seagetch/aivisspeech)（テキスト→音声合成/TTS）
