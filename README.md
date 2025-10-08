@@ -25,19 +25,21 @@ aituber-talkは、**テキストを入力するとAIアバターがその内容�
 - **リアルタイムモーション送信:** 生成された顔のモーションをVMCプロトコルで送信し、VRMアバターなどをリアルタイムに動かせます。
 - **高品質なAIモデル:** aivisspeechによる高品質な音声合成と、SadTalkerによる高精度な顔アニメーション生成を統合。
 - **プレゼンテーションモード:** PowerPointと連携し、スライドのノートを自動で読み上げてプレゼンテーションを自動進行させる機能を搭載。
+- **FaceTrackerモード:** Webカメラを使用し、リアルタイムで顔の動きをキャプチャーしてアバターに反映させる機能を搭載。
 
 ---
 
 ## システムアーキテクチャ
 
-`app.py`が単一のエントリポイントとなり、バックエンドとなる「コントローラーサービス」と、操作用の「UI」を起動します。
+`app.py`が単一のエントリポイントとなり、バックエンドとなる「コントローラーサービス」と、操作用の「UI」を起動します。コントローラーは、テキスト読み上げ（Talk）、プレゼンテーション（Present）、顔追跡（FaceTracker）といった各モードに応じて、`SadTalker`、`nijitrack`などのAIライブラリを協調させてモーションを生成し、VMCプロトコルで送信します。
 
 ```mermaid
 flowchart TD
-    subgraph User Interface
+    subgraph User & Inputs
         direction LR
         user_desktop["User (Desktop App)"]
         user_web["User (Web Browser)"]
+        camera[fa:fa-camera Camera]
     end
 
     subgraph AITuber Talk Application
@@ -47,13 +49,19 @@ flowchart TD
         web_ui["Web UI (Gradio)"]
     end
 
+    subgraph AI & Core Libraries
+        sadtalker["SadTalker"]
+        nijitrack["nijitrack"]
+    end
+
     subgraph External Services
         aivisspeech["aivisspeech (TTS)"]
-        vmc_receiver["Avatar App (VMC Receiver)"]
+        vmc_app["VRM/VMC Application"]
     end
 
     user_desktop --> pyqt_ui
     user_web --> web_ui
+    camera --> controller
 
     app_py --> controller
     app_py --> pyqt_ui
@@ -62,9 +70,10 @@ flowchart TD
     pyqt_ui -->|HTTP API| controller
     web_ui -->|HTTP API| controller
 
-    controller -->|Generates Motion| SadTalker
+    controller -->|Talk/Present| sadtalker
+    controller -->|FaceTracker| nijitrack
     controller -->|HTTP API| aivisspeech
-    controller -->|VMC Protocol| vmc_receiver
+    controller -->|VMC Protocol| vmc_app
 ```
 
 ---
@@ -103,9 +112,29 @@ bash ./scripts/setup_env.sh
 bash ./scripts/setup_sadtalker.sh
 ```
 
-### 3. (任意) aivisspeechのセットアップ
+### 3. FaceTracker(nijitrack)のセットアップ
 
-高品質な日本語音声合成を利用するには、別途[aivisspeech](https://github.com/seagetch/aivisspeech)のセットアップが必要です。手順に従ってDockerコンテナを起動してください。
+FaceTrackerモードを使用するために、`nijitrack`ライブラリをインストールします。
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\setup_nijitrack.ps1
+```
+
+**Linux/macOS (Bash):**
+```bash
+bash ./scripts/setup_nijitrack.sh
+```
+
+### 4. (任意) aivisspeechのセットアップ
+
+高品質な日本語音声合成を利用するには、別途[aivisspeech](https://github.com/seagetch/aivisspeech)のセットアップが必要です。
+
+- **Windows/macOS (推奨):**
+  [リリースページ](https://github.com/seagetch/aivisspeech/releases)から最新版のアプリケーションをダウンロード・インストールして起動してください。
+
+- **Linux:**
+  Dockerコンテナを起動するのが簡単です。`aivisspeech`リポジトリの手順に従ってください。
 
 
 ---
@@ -134,6 +163,15 @@ python app.py --ui web
 
 起動後、ターミナルに表示されるURL (`http://127.0.0.1:8000`など) にブラウザでアクセスしてください。
 
+### FaceTrackerモードの使い方
+
+PyQt・Web UIどちらにも「FaceTracker」タブが追加されています。
+
+1. 「FaceTracker」タブを開きます。
+2. 使用するカメラの番号や、VMCを送信したいアプリケーションのホスト・ポートを設定します。
+3. 「Start Tracking」ボタンを押すと、Webカメラが起動し、顔の動きの送信が開始されます。
+4. 「Stop Tracking」ボタンで追跡を停止します。
+
 ### 主なコマンドライン引数
 
 - `--ui [pyqt|web]`: 起動するUIを選択します (デフォルト: `pyqt`)。
@@ -152,8 +190,9 @@ python app.py --ui web
   - `web/app.py`: Gradio Web UIの実装
 - `controller/`: バックエンドのコントローラーサービス関連のコード
 - `core/`: `TalkEngine`など、中核となるAI処理パイプライン
+- `plugins/`: `Talk`, `Present`, `FaceTracker`などの各モードの実装
 - `SadTalker/`: SadTalker本体および関連ファイル
-- `scripts/`: セットアップ用のスクリプト
+- `scripts/`: `setup_env`, `setup_sadtalker`, `setup_nijitrack`などのセットアップ用スクリプト
 
 ## ライセンス
 
