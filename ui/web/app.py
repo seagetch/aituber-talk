@@ -42,6 +42,11 @@ body { background: #0f172a; }
 .session-flags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
 .session-flag { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #374151; color: #e5e7eb; }
 .session-empty { padding: 20px; border: 1px dashed #374151; border-radius: 10px; text-align: center; color: #9ca3af; margin-top: 12px; }
+.watch-badge { border: 1px solid #374151; background: #111827; border-radius: 8px; padding: 14px 16px; margin: 8px 0 12px; font-weight: 700; font-size: 1.05rem; }
+.watch-badge.running { border-color: #22c55e; color: #bbf7d0; background: #052e16; }
+.watch-badge.starting { border-color: #38bdf8; color: #bae6fd; background: #082f49; }
+.watch-badge.stopped { border-color: #475569; color: #cbd5e1; background: #111827; }
+.watch-badge.error { border-color: #ef4444; color: #fecaca; background: #450a0a; }
 </style>
 """
 
@@ -71,6 +76,12 @@ def list_sessions(controller_url: str) -> List[Dict[str, Any]]:
 
 def list_present_sessions(controller_url: str) -> List[Dict[str, Any]]:
     return [s for s in list_sessions(controller_url) if s.get("mode") == "present"]
+
+def list_codex_sessions(controller_url: str) -> List[Dict[str, Any]]:
+    data = _fetch_json("GET", f"{controller_url}/codex/sessions", timeout=10)
+    if isinstance(data, dict) and "error" not in data:
+        return data.get("sessions", [])
+    return []
 
 def get_session_status(controller_url: str, session_id: str) -> Dict[str, Any]:
     return _fetch_json("GET", f"{controller_url}/sessions/{session_id}", timeout=5)
@@ -459,6 +470,175 @@ def build_ui(
                 return resp["error"]
             return json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
 
+        def codex_session_choices() -> Tuple[List[Tuple[str, str]], Dict[str, Dict[str, Any]], Optional[str]]:
+            sessions = list_codex_sessions(controller_url)
+            details: Dict[str, Dict[str, Any]] = {}
+            choices: List[Tuple[str, str]] = []
+            for item in sessions:
+                session_id = item.get("id")
+                if not session_id:
+                    continue
+                details[str(session_id)] = item
+                thread_name = item.get("thread_name") or session_id
+                cwd = Path(item.get("cwd") or "").name if item.get("cwd") else "?"
+                updated_at = item.get("updated_at") or ""
+                label = f"{thread_name} | {cwd} | {updated_at}"
+                choices.append((label, str(session_id)))
+            return choices, details, choices[0][1] if choices else None
+
+        def refresh_codex_choices(current: Optional[str]) -> Tuple[gr.Dropdown, Dict[str, Dict[str, Any]], str, str]:
+            choices, details, default = codex_session_choices()
+            values = {value for _, value in choices}
+            selected = current if current in values else default
+            status = f"Session list: {len(choices)} sessions loaded at {time.strftime('%H:%M:%S')}"
+            return gr.update(choices=choices, value=selected), details, format_codex_details(selected, details), status
+
+        def refresh_codex_choices_if_enabled(
+            enabled: bool,
+            current: Optional[str],
+            details: Dict[str, Dict[str, Any]],
+            current_details: str,
+            current_status: str,
+        ) -> Tuple[gr.Dropdown, Dict[str, Dict[str, Any]], str, str]:
+            if not enabled:
+                return gr.update(), details, current_details, current_status
+            return refresh_codex_choices(current)
+
+        def format_codex_details(session_id: Optional[str], details: Dict[str, Dict[str, Any]]) -> str:
+            if not session_id:
+                return "No Codex sessions found."
+            item = details.get(session_id, {})
+            lines = [
+                f"**session id:** {item.get('id', session_id)}",
+                f"**thread name:** {item.get('thread_name', '?')}",
+                f"**cwd:** {item.get('cwd') or '?'}",
+                f"**updated_at:** {item.get('updated_at') or '?'}",
+                f"**rollout path:** {item.get('rollout_path') or '?'}",
+            ]
+            return "  \n".join(lines)
+
+        def submit_codex_watch(
+            session_id: Optional[str],
+            details: Dict[str, Dict[str, Any]],
+            character_profile: str,
+            style_choice: Optional[str],
+            model: str,
+            event_types: Optional[List[str]],
+        ) -> Tuple[str, str, str, Optional[str]]:
+            if not session_id:
+                status_text = "Watch status: stopped"
+                return "Select a Codex session first.", render_codex_watch_badge(status_text), status_text, None
+            item = details.get(session_id, {})
+            payload = {
+                "mode": "codex_watch",
+                "payload": {
+                    "session_id": session_id,
+                    "rollout_path": item.get("rollout_path"),
+                    "character_profile": character_profile,
+                    "style_id": parse_style(style_choice),
+                    "model": model or "gpt-5.4-nano",
+                    "event_types": event_types or ["assistant_message"],
+                },
+            }
+            resp = create_session(controller_url, payload)
+            if isinstance(resp, dict) and "error" in resp and len(resp) == 1:
+                status_text = "Watch status: error"
+                return resp["error"], render_codex_watch_badge(status_text), status_text, None
+            created_session = resp.get("session", {}) if isinstance(resp, dict) else {}
+            controller_session_id = created_session.get("id")
+            result_status = resp.get("result", {}).get("status") if isinstance(resp, dict) else None
+            status = created_session.get("status") or result_status or "unknown"
+            status_text = f"Watch status: {status or 'unknown'}"
+            if controller_session_id:
+                status_text += f"  \nController session: `{controller_session_id}`"
+            message = json.dumps(resp, ensure_ascii=False, indent=2) if isinstance(resp, dict) else str(resp)
+            return message, render_codex_watch_badge(status_text), status_text, controller_session_id
+
+        def stop_codex_watch(session_id: Optional[str]) -> Tuple[str, str, str]:
+            if not session_id:
+                status_text = "Watch status: stopped"
+                return "Session ID is required", render_codex_watch_badge(status_text), status_text
+            result_text = send_command(controller_url, session_id, "stop")
+            status_text = "Watch status: stopped"
+            return result_text, render_codex_watch_badge(status_text), status_text
+
+        def poll_codex_watch_status(session_id: Optional[str]) -> str:
+            if not session_id:
+                return "Watch status: stopped"
+            detail = get_session_status(controller_url, session_id)
+            if not isinstance(detail, dict) or "error" in detail:
+                return f"Watch status: error  \n{detail.get('error') if isinstance(detail, dict) else detail}"
+            session_info = detail.get("session", {}) or {}
+            status_info = detail.get("status", {}) or {}
+            watch_status = status_info.get("watch_status") or session_info.get("status") or "unknown"
+            lines = [
+                f"Watch status: {watch_status}",
+                f"Controller session: `{session_id}`",
+            ]
+            codex_session = status_info.get("codex_session_id")
+            if codex_session:
+                lines.append(f"Codex session: `{codex_session}`")
+            messages_seen = status_info.get("messages_seen")
+            utterances_generated = status_info.get("utterances_generated")
+            if messages_seen is not None:
+                lines.append(f"Messages seen: {messages_seen}")
+            if utterances_generated is not None:
+                lines.append(f"Utterances generated: {utterances_generated}")
+            last_error = status_info.get("last_error")
+            if last_error:
+                lines.append(f"Last error: {last_error}")
+            return "  \n".join(lines)
+
+        def poll_codex_watch_area(session_id: Optional[str]) -> Tuple[str, str, str, str, str, str]:
+            if not session_id:
+                status_text = "Watch status: stopped"
+                return render_codex_watch_badge(status_text), status_text, "", "", "", ""
+            detail = get_session_status(controller_url, session_id)
+            if not isinstance(detail, dict) or "error" in detail:
+                error = detail.get("error") if isinstance(detail, dict) else str(detail)
+                status_text = "Watch status: error"
+                return render_codex_watch_badge(status_text), status_text, "", "", "", str(error)
+            session_info = detail.get("session", {}) or {}
+            status_info = detail.get("status", {}) or {}
+            watch_status = status_info.get("watch_status") or session_info.get("status") or "unknown"
+            status_text = "\n".join(
+                [
+                    f"Watch status: {watch_status}",
+                    f"Controller session: {session_id}",
+                    f"Codex session: {status_info.get('codex_session_id') or '?'}",
+                    f"Messages seen: {status_info.get('messages_seen', 0)}",
+                    f"Utterances generated: {status_info.get('utterances_generated', 0)}",
+                    f"Delivery policy: {status_info.get('delivery_policy') or 'full'}",
+                    f"Estimated wait: {status_info.get('estimated_wait_sec', 0)} sec",
+                    f"Watcher activity: {status_info.get('last_watcher_activity') or 'waiting for file changes'}",
+                    f"Lines read: {status_info.get('lines_read', 0)} / ignored: {status_info.get('ignored_lines', 0)}",
+                ]
+            )
+            history = status_info.get("recent_utterance_history") or []
+            return (
+                render_codex_watch_badge(status_text),
+                status_text,
+                status_info.get("last_codex_message") or "",
+                status_info.get("last_utterance") or "",
+                "\n".join(str(item) for item in history[-10:]),
+                status_info.get("last_error") or "",
+            )
+
+        def render_codex_watch_badge(status_text: str) -> str:
+            normalized = (status_text or "").lower()
+            if "running" in normalized:
+                state = "running"
+                label = "監視中"
+            elif "starting" in normalized:
+                state = "starting"
+                label = "開始中"
+            elif "error" in normalized:
+                state = "error"
+                label = "エラー"
+            else:
+                state = "stopped"
+                label = "停止中"
+            return f"<div class='watch-badge {state}'>Codex Watch: {label}</div>"
 
         def submit_present(
             style_choice: Optional[str],
@@ -1016,6 +1196,126 @@ def build_ui(
                         submit_talk,
                         inputs=[talk_text, style_dropdown, talk_sync],
                         outputs=talk_result,
+                    )
+
+                with gr.TabItem("Codex Watch"):
+                    initial_codex_choices, initial_codex_details, initial_codex_value = codex_session_choices()
+                    codex_details_state = gr.State(initial_codex_details)
+                    codex_controller_session = gr.State(None)
+                    codex_session_dropdown = gr.Dropdown(
+                        label="Codex session",
+                        choices=initial_codex_choices,
+                        value=initial_codex_value,
+                        interactive=True,
+                    )
+                    codex_details = gr.Markdown(format_codex_details(initial_codex_value, initial_codex_details))
+                    with gr.Row():
+                        refresh_codex_button = gr.Button("Refresh Codex Sessions", variant="secondary")
+                        auto_refresh_codex = gr.Checkbox(label="Auto refresh session list", value=True)
+                    codex_session_list_status = gr.Markdown(
+                        f"Session list: {len(initial_codex_choices)} sessions loaded at {time.strftime('%H:%M:%S')}"
+                    )
+                    codex_profile = gr.Textbox(
+                        label="Character profile",
+                        lines=7,
+                        value=(
+                            "性格: 落ち着いていて実務的\n"
+                            "口調: 短く自然な日本語\n"
+                            "一人称: 私\n"
+                            "ユーザーへの呼び方: あなた\n"
+                            "禁止事項: 内部ログやツール出力をそのまま読まない"
+                        ),
+                    )
+                    codex_model = gr.Textbox(label="OpenAI model", value="gpt-5.4-nano")
+                    codex_event_types = gr.CheckboxGroup(
+                        label="Watch event types",
+                        choices=[("Assistant-visible messages only", "assistant_message")],
+                        value=["assistant_message"],
+                    )
+                    with gr.Row():
+                        start_codex_button = gr.Button("Start Watching", variant="primary")
+                        stop_codex_button = gr.Button("Stop Watching", variant="stop")
+                    with gr.Group():
+                        gr.Markdown("### Codex Watch Status")
+                        codex_watch_badge = gr.HTML(render_codex_watch_badge("Watch status: stopped"))
+                        codex_watch_status = gr.Textbox(label="Watch status", value="Watch status: stopped", lines=5, interactive=False)
+                        codex_last_message = gr.Textbox(label="Last Codex message", lines=5, interactive=False)
+                        codex_last_utterance = gr.Textbox(label="Last generated utterance", lines=3, interactive=False)
+                        codex_utterance_history = gr.Textbox(label="Recent utterance history", lines=8, interactive=False)
+                        codex_error_log = gr.Textbox(label="Error log", lines=4, interactive=False)
+                    codex_result = gr.Textbox(label="Result", interactive=False)
+
+                    refresh_codex_button.click(
+                        refresh_codex_choices,
+                        inputs=[codex_session_dropdown],
+                        outputs=[codex_session_dropdown, codex_details_state, codex_details, codex_session_list_status],
+                    )
+                    codex_session_refresh_timer = gr.Timer(value=3.0)
+                    codex_session_refresh_timer.tick(
+                        refresh_codex_choices_if_enabled,
+                        inputs=[
+                            auto_refresh_codex,
+                            codex_session_dropdown,
+                            codex_details_state,
+                            codex_details,
+                            codex_session_list_status,
+                        ],
+                        outputs=[
+                            codex_session_dropdown,
+                            codex_details_state,
+                            codex_details,
+                            codex_session_list_status,
+                        ],
+                        queue=False,
+                        show_progress="hidden",
+                    )
+                    codex_session_dropdown.change(
+                        format_codex_details,
+                        inputs=[codex_session_dropdown, codex_details_state],
+                        outputs=codex_details,
+                    )
+                    start_codex_button.click(
+                        submit_codex_watch,
+                        inputs=[
+                            codex_session_dropdown,
+                            codex_details_state,
+                            codex_profile,
+                            style_dropdown,
+                            codex_model,
+                            codex_event_types,
+                        ],
+                        outputs=[codex_result, codex_watch_badge, codex_watch_status, codex_controller_session],
+                    ).then(
+                        poll_codex_watch_area,
+                        inputs=[codex_controller_session],
+                        outputs=[
+                            codex_watch_badge,
+                            codex_watch_status,
+                            codex_last_message,
+                            codex_last_utterance,
+                            codex_utterance_history,
+                            codex_error_log,
+                        ],
+                    )
+                    stop_codex_button.click(
+                        stop_codex_watch,
+                        inputs=[codex_controller_session],
+                        outputs=[codex_result, codex_watch_badge, codex_watch_status],
+                    )
+                    codex_area_timer = gr.Timer(value=2.0)
+                    codex_area_timer.tick(
+                        poll_codex_watch_area,
+                        inputs=[codex_controller_session],
+                        outputs=[
+                            codex_watch_badge,
+                            codex_watch_status,
+                            codex_last_message,
+                            codex_last_utterance,
+                            codex_utterance_history,
+                            codex_error_log,
+                        ],
+                        queue=False,
+                        show_progress="hidden",
                     )
 
                 with gr.TabItem("Present"):

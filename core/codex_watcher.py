@@ -22,6 +22,17 @@ class CodexMessageEvent:
     raw: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CodexWatcherActivity:
+    session_file: Path
+    bytes_read: int
+    lines_read: int
+    events_emitted: int
+    ignored_lines: int
+    offset: int
+    partial_buffer_bytes: int
+
+
 def _extract_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
@@ -105,9 +116,18 @@ class CodexJsonlWatcher:
         self.poll_interval = poll_interval
         self.offset = self.path.stat().st_size if start_at_end and self.path.exists() else 0
         self.partial_buffer = ""
-        self.session_meta: Dict[str, Any] = {}
+        self.session_meta: Dict[str, Any] = self._read_initial_meta()
+        self.last_activity = CodexWatcherActivity(self.path, 0, 0, 0, 0, self.offset, 0)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _read_initial_meta(self) -> Dict[str, Any]:
+        try:
+            from core.codex_sessions import read_rollout_meta
+
+            return dict(read_rollout_meta(self.path))
+        except Exception:
+            return {}
 
     def read_available(self) -> List[CodexMessageEvent]:
         if not self.path.exists():
@@ -121,6 +141,7 @@ class CodexJsonlWatcher:
             chunk = fh.read()
             self.offset = fh.tell()
         if not chunk:
+            self.last_activity = CodexWatcherActivity(self.path, 0, 0, 0, 0, self.offset, len(self.partial_buffer.encode("utf-8")))
             return []
         text = self.partial_buffer + chunk
         if text.endswith("\n"):
@@ -129,58 +150,93 @@ class CodexJsonlWatcher:
         else:
             lines = text.splitlines()
             self.partial_buffer = lines.pop() if lines else text
-        return list(self._parse_lines(lines))
+        events, ignored = self._parse_lines(lines)
+        self.last_activity = CodexWatcherActivity(
+            self.path,
+            len(chunk.encode("utf-8")),
+            len(lines),
+            len(events),
+            ignored,
+            self.offset,
+            len(self.partial_buffer.encode("utf-8")),
+        )
+        return events
 
-    def _parse_lines(self, lines: Iterable[str]) -> Iterable[CodexMessageEvent]:
+    def _parse_lines(self, lines: Iterable[str]) -> tuple[List[CodexMessageEvent], int]:
+        events: List[CodexMessageEvent] = []
+        ignored = 0
         for line in lines:
             line = line.strip()
             if not line:
+                ignored += 1
                 continue
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
+                ignored += 1
                 continue
             if not isinstance(raw, dict):
+                ignored += 1
                 continue
             event = normalize_codex_event(raw, self.path, self.session_meta)
             if event is not None:
-                yield event
+                events.append(event)
+            else:
+                ignored += 1
+        return events, ignored
 
-    def start(self, callback: Callable[[CodexMessageEvent], None], error_callback: Optional[Callable[[Exception], None]] = None) -> None:
+    def start(
+        self,
+        callback: Callable[[CodexMessageEvent], None],
+        error_callback: Optional[Callable[[Exception], None]] = None,
+        activity_callback: Optional[Callable[[CodexWatcherActivity], None]] = None,
+    ) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run,
-            args=(callback, error_callback),
+            args=(callback, error_callback, activity_callback),
             name=f"CodexJsonlWatcher-{self.path.name}",
             daemon=True,
         )
         self._thread.start()
 
-    def _run(self, callback: Callable[[CodexMessageEvent], None], error_callback: Optional[Callable[[Exception], None]]) -> None:
-        try:
-            from watchfiles import watch
+    def _read_and_emit(
+        self,
+        callback: Callable[[CodexMessageEvent], None],
+        activity_callback: Optional[Callable[[CodexWatcherActivity], None]],
+    ) -> None:
+        events = self.read_available()
+        if self.last_activity.bytes_read or self.last_activity.lines_read or self.last_activity.partial_buffer_bytes:
+            if activity_callback:
+                activity_callback(self.last_activity)
+        for event in events:
+            callback(event)
 
-            for _changes in watch(self.path.parent, stop_event=self._stop_event, watch_filter=self._watch_filter):
-                for event in self.read_available():
-                    callback(event)
-                if self._stop_event.is_set():
-                    return
-        except ImportError:
-            self._poll(callback, error_callback)
-        except Exception as exc:
-            if error_callback:
-                error_callback(exc)
+    def _run(
+        self,
+        callback: Callable[[CodexMessageEvent], None],
+        error_callback: Optional[Callable[[Exception], None]],
+        activity_callback: Optional[Callable[[CodexWatcherActivity], None]],
+    ) -> None:
+        # A Codex rollout is a single append-only JSONL file. Polling the file
+        # size/offset is more reliable than depending on platform file events,
+        # especially when another process keeps the file open and appends often.
+        self._poll(callback, error_callback, activity_callback)
 
     def _watch_filter(self, change: object, path: str) -> bool:
         return Path(path).resolve() == self.path
 
-    def _poll(self, callback: Callable[[CodexMessageEvent], None], error_callback: Optional[Callable[[Exception], None]]) -> None:
+    def _poll(
+        self,
+        callback: Callable[[CodexMessageEvent], None],
+        error_callback: Optional[Callable[[Exception], None]],
+        activity_callback: Optional[Callable[[CodexWatcherActivity], None]],
+    ) -> None:
         while not self._stop_event.wait(self.poll_interval):
             try:
-                for event in self.read_available():
-                    callback(event)
+                self._read_and_emit(callback, activity_callback)
             except Exception as exc:
                 if error_callback:
                     error_callback(exc)
@@ -192,4 +248,4 @@ class CodexJsonlWatcher:
             self._thread.join(timeout=timeout)
 
 
-__all__ = ["CodexJsonlWatcher", "CodexMessageEvent", "normalize_codex_event"]
+__all__ = ["CodexJsonlWatcher", "CodexMessageEvent", "CodexWatcherActivity", "normalize_codex_event"]

@@ -13,6 +13,7 @@ from controller.registry import ModeRegistry
 from controller.session import SessionManager
 from core.talk_engine import TalkEngine, TalkEngineConfig
 from plugins.base import Mode
+from plugins.codex_watch import DEFAULT_MODEL, DEFAULT_PROFILE, CodexWatchMode
 from plugins.facetracker import FaceTrackerMode
 from plugins.present import PresentMode
 from plugins.talk import TalkMode
@@ -38,7 +39,7 @@ class ControllerApp:
         self.upload_dir = Path(upload_dir or Path("uploads")).resolve()
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.fastapi = FastAPI(title="AITuber Controller", version="0.1.0")
-        self.fastapi.add_event_handler("shutdown", self.shutdown_engine)
+        self.fastapi.on_event("shutdown")(self.shutdown_engine)
         self._mode_cache: Dict[str, Mode] = {}
         self._register_builtin_modes()
         attach_routes(self.fastapi, self)
@@ -50,6 +51,53 @@ class ControllerApp:
 
     # ------------------------------------------------------------------
     def _register_builtin_modes(self) -> None:
+        self.registry.register(
+            "codex_watch",
+            lambda **deps: CodexWatchMode(
+                engine=self.engine,
+                event_bus=self.event_bus,
+                sessions=self.sessions,
+            ),
+            description="Watch a Codex session and speak assistant updates",
+            metadata={
+                "requires": ["session_id or rollout_path"],
+                "optional": ["character_profile", "style_id", "model", "event_types"],
+                "form": [
+                    {
+                        "type": "select",
+                        "name": "session_id",
+                        "label": "Codex session",
+                        "dynamic_source": "/codex/sessions",
+                        "required": False,
+                    },
+                    {
+                        "type": "text",
+                        "name": "rollout_path",
+                        "label": "Rollout JSONL path",
+                        "required": False,
+                    },
+                    {
+                        "type": "textarea",
+                        "name": "character_profile",
+                        "label": "Character profile",
+                        "lines": 6,
+                        "default": DEFAULT_PROFILE,
+                    },
+                    {
+                        "type": "text",
+                        "name": "model",
+                        "label": "OpenAI model",
+                        "default": DEFAULT_MODEL,
+                    },
+                    {
+                        "type": "text",
+                        "name": "event_types",
+                        "label": "Watch event types",
+                        "default": "assistant_message",
+                    },
+                ],
+            },
+        )
         self.registry.register(
             "talk",
             lambda **deps: TalkMode(

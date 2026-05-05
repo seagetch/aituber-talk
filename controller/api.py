@@ -14,6 +14,7 @@ from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from core.codex_sessions import list_codex_sessions
 from controller.session import Session
 from plugins.base import Mode
 
@@ -34,6 +35,15 @@ class SettingsUpdateRequest(BaseModel):
     jaw_open_source_index: Optional[int] = None
     jaw_open_zero_value: Optional[float] = None
     jaw_open_one_value: Optional[float] = None
+
+
+PERSISTENT_MODES = {"codex_watch"}
+
+
+def _should_stop_for_new_session(new_mode: str, active_mode: str) -> bool:
+    if active_mode in PERSISTENT_MODES and active_mode != new_mode:
+        return False
+    return True
 
 
 def attach_routes(app: FastAPI, controller) -> None:
@@ -58,6 +68,10 @@ def attach_routes(app: FastAPI, controller) -> None:
             "jaw_open_current_source": engine_status.get("jaw_open_current_source"),
             "jaw_open_current_value": engine_status.get("jaw_open_current_value"),
         }
+
+    @router.get("/codex/sessions")
+    async def list_codex_session_candidates() -> Dict[str, Any]:
+        return {"sessions": [session.as_dict() for session in list_codex_sessions()]}
 
     @router.patch("/settings")
     async def update_settings(req: SettingsUpdateRequest) -> Dict[str, Any]:
@@ -137,7 +151,12 @@ def attach_routes(app: FastAPI, controller) -> None:
             raise HTTPException(status_code=404, detail=f"Mode '{req.mode}' not found")
 
         # Stop any currently active sessions and wait for them to finish
-        active_sessions = [s for s in controller.sessions.list() if s.status not in {"completed", "stopped", "error"}]
+        active_sessions = [
+            s
+            for s in controller.sessions.list()
+            if s.status not in {"completed", "stopped", "error"}
+            and _should_stop_for_new_session(req.mode, s.mode)
+        ]
         if active_sessions:
             loop = asyncio.get_running_loop()
             for session_to_stop in active_sessions:

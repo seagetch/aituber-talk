@@ -86,7 +86,10 @@ _orig_blink = _gb.generate_blink_seq_randomly
 def _safe_blink(frame_count: int) -> List[float]:
     if frame_count < 10:
         return [0.0] * frame_count
-    return list(map(float, _orig_blink(frame_count)))
+    values = np.asarray(_orig_blink(frame_count), dtype=np.float32).reshape(-1)
+    if values.size < frame_count:
+        values = np.pad(values, (0, frame_count - values.size), mode="constant")
+    return [float(value) for value in values[:frame_count]]
 
 
 _gb.generate_blink_seq_randomly = _safe_blink
@@ -145,6 +148,16 @@ def tts_generate(text: str, style: int, host: str, port: int) -> bytes:
     )
     synthesis.raise_for_status()
     return synthesis.content
+
+
+def _wav_duration_seconds(wav: bytes) -> float:
+    try:
+        with wave.open(BytesIO(wav), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            return frames / rate if rate else 0.0
+    except Exception:
+        return 0.0
 
 
 def adjust_blink(coeff: np.ndarray, no_blink: bool = False) -> np.ndarray:
@@ -401,6 +414,9 @@ class TalkEngine:
         self._idle_enabled = threading.Event()
         self._current_session_id: Optional[str] = None
         self._state_lock = threading.Lock()
+        self._speech_timing_lock = threading.Lock()
+        self._current_speech_ends_at: Optional[float] = None
+        self._queued_speech_seconds: float = 0.0
         self._jaw_open_lock = threading.Lock()
         self._last_jaw_open_source: Optional[float] = None
         self._last_jaw_open_value: Optional[float] = None
@@ -479,10 +495,7 @@ class TalkEngine:
         )
         if on_progress:
             on_progress("tts_completed", sentence)
-        with wave.open(BytesIO(wav), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            duration = frames / rate if rate else 0.0
+        duration = _wav_duration_seconds(wav)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
             tmp.write(wav)
@@ -646,6 +659,11 @@ class TalkEngine:
     def status(self) -> Dict[str, Any]:
         with self._state_lock:
             session = self._current_session_id
+        with self._speech_timing_lock:
+            now = time.monotonic()
+            current_remaining = max(0.0, (self._current_speech_ends_at or 0.0) - now)
+            queued_speech_seconds = max(0.0, self._queued_speech_seconds)
+            speech_available_in = current_remaining + queued_speech_seconds
         with self._jaw_open_lock:
             jaw_open_source = self._last_jaw_open_source
             jaw_open_value = self._last_jaw_open_value
@@ -661,6 +679,9 @@ class TalkEngine:
             "session": session,
             "paused": self._pause_event.is_set(),
             "queued": queued,
+            "current_speech_remaining_sec": current_remaining,
+            "queued_speech_seconds": queued_speech_seconds,
+            "speech_available_in_sec": speech_available_in,
             "jaw_open_scale": self.config.jaw_open_scale,
             "jaw_open_source_index": self.config.jaw_open_source_index,
             "jaw_open_zero_value": self.config.jaw_open_zero_value,
@@ -753,6 +774,9 @@ class TalkEngine:
                         tmp.close()
                         os.unlink(tmp.name)
                     if self._motion_queue is not None:
+                        duration = _wav_duration_seconds(wav)
+                        with self._speech_timing_lock:
+                            self._queued_speech_seconds += duration
                         self._motion_queue.put((wav, coeff, req_id))
             except Exception as exc:  # pragma: no cover - defensive
                 thread_logger.error("text producer failure: %s", exc, exc_info=True)
@@ -847,6 +871,8 @@ class TalkEngine:
                     wav_path = Path(tmp.name)
                 sound = pygame.mixer.Sound(str(wav_path))
                 length = sound.get_length()
+                with self._speech_timing_lock:
+                    self._queued_speech_seconds = max(0.0, self._queued_speech_seconds - length)
                 if coeff is None or coeff.size == 0:
                     coeff = sadtalker_coeff(
                         self._image_path,
@@ -862,6 +888,8 @@ class TalkEngine:
 
                 with self._state_lock:
                     self._current_session_id = req_id
+                with self._speech_timing_lock:
+                    self._current_speech_ends_at = time.monotonic() + length
 
                 channel = sound.play()
                 start = time.perf_counter()
@@ -902,6 +930,8 @@ class TalkEngine:
                     os.unlink(str(wav_path))
                     with self._state_lock:
                         self._current_session_id = None
+                    with self._speech_timing_lock:
+                        self._current_speech_ends_at = None
 
                 if req_id is not None:
                     with self._playback_lock:

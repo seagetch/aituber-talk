@@ -60,6 +60,12 @@ def list_sessions(controller_url: str) -> List[Dict[str, Any]]:
 def list_present_sessions(controller_url: str) -> List[Dict[str, Any]]:
     return [s for s in list_sessions(controller_url) if s.get("mode") == "present"]
 
+def list_codex_sessions(controller_url: str) -> List[Dict[str, Any]]:
+    data = _fetch_json("GET", f"{controller_url}/codex/sessions", timeout=10)
+    if isinstance(data, dict) and "error" not in data:
+        return data.get("sessions", [])
+    return []
+
 def get_session_status(controller_url: str, session_id: str) -> Dict[str, Any]:
     return _fetch_json("GET", f"{controller_url}/sessions/{session_id}", timeout=5)
 
@@ -261,16 +267,19 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.talk_tab = QWidget()
+        self.codex_watch_tab = QWidget()
         self.present_tab = QWidget()
         self.facetracker_tab = QWidget()
         self.sessions_tab = QWidget()
         self.tabs.addTab(self.talk_tab, "Talk")
+        self.tabs.addTab(self.codex_watch_tab, "Codex Watch")
         self.tabs.addTab(self.present_tab, "Present")
         self.tabs.addTab(self.facetracker_tab, "FaceTracker")
         self.tabs.addTab(self.sessions_tab, "Sessions")
         self.layout.addWidget(self.tabs)
 
         self.init_talk_tab()
+        self.init_codex_watch_tab()
         self.init_present_tab()
         self.init_facetracker_tab()
         self.init_sessions_tab()
@@ -293,6 +302,7 @@ class MainWindow(QMainWindow):
         """Signal background threads to stop and trigger app exit."""
         self.refresh_timer.stop()
         self.motion_settings_timer.stop()
+        self.codex_sessions_timer.stop()
         self.event_listener.stop()
         self.event_listener.wait(1000)
         if self.event_listener.isRunning():
@@ -317,6 +327,7 @@ class MainWindow(QMainWindow):
         self._ui_updates_paused = True
         self.refresh_timer.stop()
         self.motion_settings_timer.stop()
+        self.codex_sessions_timer.stop()
         if self._event_listener_connected:
             try:
                 self.event_listener.newEvent.disconnect(self.handle_event)
@@ -333,7 +344,9 @@ class MainWindow(QMainWindow):
         self._ui_updates_paused = False
         self.refresh_timer.start(5000)
         self.motion_settings_timer.start(1000)
+        self.codex_sessions_timer.start(3000)
         self.refresh_present_sessions()
+        self.refresh_codex_sessions()
         self.load_motion_settings()
 
     def init_talk_tab(self):
@@ -352,6 +365,89 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Result:"))
         layout.addWidget(self.talk_result)
         self.talk_button.clicked.connect(self.submit_talk)
+
+    def init_codex_watch_tab(self):
+        layout = QVBoxLayout(self.codex_watch_tab)
+        form_layout = QFormLayout()
+        self.codex_session_dropdown = QComboBox()
+        form_layout.addRow("Codex session:", self.codex_session_dropdown)
+        self.codex_session_details = QTextEdit()
+        self.codex_session_details.setReadOnly(True)
+        form_layout.addRow("Session details:", self.codex_session_details)
+        self.codex_profile = QTextEdit()
+        self.codex_profile.setPlainText(
+            "性格: 落ち着いていて実務的\n"
+            "口調: 短く自然な日本語\n"
+            "一人称: 私\n"
+            "ユーザーへの呼び方: あなた\n"
+            "禁止事項: 内部ログやツール出力をそのまま読まない"
+        )
+        form_layout.addRow("Character profile:", self.codex_profile)
+        self.codex_model_edit = QLineEdit("gpt-5.4-nano")
+        form_layout.addRow("OpenAI model:", self.codex_model_edit)
+        self.codex_assistant_messages_checkbox = QCheckBox("Assistant-visible messages only")
+        self.codex_assistant_messages_checkbox.setChecked(True)
+        form_layout.addRow("Watch event types:", self.codex_assistant_messages_checkbox)
+        layout.addLayout(form_layout)
+
+        buttons_layout = QHBoxLayout()
+        self.refresh_codex_sessions_button = QPushButton("Refresh Codex Sessions")
+        self.auto_refresh_codex_sessions_checkbox = QCheckBox("Auto refresh session list")
+        self.auto_refresh_codex_sessions_checkbox.setChecked(True)
+        self.start_codex_watch_button = QPushButton("Start Watching")
+        self.stop_codex_watch_button = QPushButton("Stop Watching")
+        buttons_layout.addWidget(self.refresh_codex_sessions_button)
+        buttons_layout.addWidget(self.auto_refresh_codex_sessions_checkbox)
+        buttons_layout.addWidget(self.start_codex_watch_button)
+        buttons_layout.addWidget(self.stop_codex_watch_button)
+        layout.addLayout(buttons_layout)
+        self.codex_session_list_status = QLabel("Session list: not loaded")
+        layout.addWidget(self.codex_session_list_status)
+
+        watch_group = QGroupBox("Codex Watch Status")
+        watch_layout = QFormLayout()
+        self.codex_watch_state_label = QLabel("stopped")
+        self.codex_watch_state_label.setMinimumHeight(34)
+        self.codex_watch_state_label.setStyleSheet(
+            "QLabel { padding: 8px 12px; border: 1px solid #475569; border-radius: 6px; "
+            "background: #111827; color: #cbd5e1; font-weight: 700; }"
+        )
+        self.set_codex_watch_state("stopped")
+        watch_layout.addRow("Watch status:", self.codex_watch_state_label)
+        self.codex_last_message = QTextEdit()
+        self.codex_last_message.setReadOnly(True)
+        self.codex_last_message.setMaximumHeight(100)
+        watch_layout.addRow("Last Codex message:", self.codex_last_message)
+        self.codex_last_utterance = QTextEdit()
+        self.codex_last_utterance.setReadOnly(True)
+        self.codex_last_utterance.setMaximumHeight(80)
+        watch_layout.addRow("Last generated utterance:", self.codex_last_utterance)
+        self.codex_utterance_history = QTextEdit()
+        self.codex_utterance_history.setReadOnly(True)
+        self.codex_utterance_history.setMaximumHeight(120)
+        watch_layout.addRow("Recent utterance history:", self.codex_utterance_history)
+        self.codex_error_log = QTextEdit()
+        self.codex_error_log.setReadOnly(True)
+        self.codex_error_log.setMaximumHeight(80)
+        watch_layout.addRow("Error log:", self.codex_error_log)
+        watch_group.setLayout(watch_layout)
+        layout.addWidget(watch_group)
+        self.codex_watch_status = QTextEdit()
+        self.codex_watch_status.setReadOnly(True)
+        layout.addWidget(QLabel("Event log:"))
+        layout.addWidget(self.codex_watch_status)
+
+        self.codex_sessions: Dict[str, Dict[str, Any]] = {}
+        self.codex_watch_session_id: Optional[str] = None
+        self._codex_refresh_inflight = False
+        self.refresh_codex_sessions_button.clicked.connect(self.refresh_codex_sessions)
+        self.codex_session_dropdown.currentTextChanged.connect(self.update_codex_session_details)
+        self.start_codex_watch_button.clicked.connect(self.submit_codex_watch)
+        self.stop_codex_watch_button.clicked.connect(self.stop_codex_watch)
+        self.codex_sessions_timer = QTimer(self)
+        self.codex_sessions_timer.timeout.connect(self.auto_refresh_codex_sessions)
+        self.codex_sessions_timer.start(3000)
+        self.refresh_codex_sessions()
 
     def init_present_tab(self):
         layout = QGridLayout(self.present_tab)
@@ -616,6 +712,21 @@ class MainWindow(QMainWindow):
         self._motion_settings_loaded = False
         self.load_motion_settings()
 
+    def set_codex_watch_state(self, state: str) -> None:
+        state = (state or "unknown").lower()
+        labels = {
+            "running": ("監視中", "#052e16", "#22c55e", "#bbf7d0"),
+            "starting": ("開始中", "#082f49", "#38bdf8", "#bae6fd"),
+            "stopped": ("停止中", "#111827", "#475569", "#cbd5e1"),
+            "error": ("エラー", "#450a0a", "#ef4444", "#fecaca"),
+        }
+        text, bg, border, color = labels.get(state, (state, "#111827", "#475569", "#cbd5e1"))
+        self.codex_watch_state_label.setText(f"Codex Watch: {text}")
+        self.codex_watch_state_label.setStyleSheet(
+            f"QLabel {{ padding: 8px 12px; border: 1px solid {border}; border-radius: 6px; "
+            f"background: {bg}; color: {color}; font-weight: 700; }}"
+        )
+
     @pyqtSlot(str, dict)
     def handle_event(self, event_name: str, payload: dict):
         if self._ui_updates_paused:
@@ -638,6 +749,33 @@ class MainWindow(QMainWindow):
         self.event_log_deque.append(log_message)
         self.present_event_log.setPlainText("\n".join(self.event_log_deque))
         self.present_event_log.verticalScrollBar().setValue(self.present_event_log.verticalScrollBar().maximum())
+        if event_name.startswith("codex_watch."):
+            if event_name == "codex_watch.started":
+                self.set_codex_watch_state("running")
+            elif event_name == "codex_watch.stopped":
+                self.set_codex_watch_state("stopped")
+            elif event_name == "codex_watch.error":
+                self.set_codex_watch_state("error")
+                self.codex_error_log.setPlainText(str(payload.get("error") or ""))
+            elif event_name == "codex_watch.codex_message":
+                self.codex_last_message.setPlainText(str(payload.get("text") or ""))
+            elif event_name == "codex_watch.file_changed":
+                self.codex_last_message.setPlaceholderText(
+                    "Watcher saw file changes: "
+                    f"{payload.get('lines_read', 0)} lines, "
+                    f"{payload.get('events_emitted', 0)} message events"
+                )
+            elif event_name in {"codex_watch.rewrite_completed", "codex_watch.speech_queued"}:
+                utterance = str(payload.get("utterance") or "")
+                if utterance:
+                    self.codex_last_utterance.setPlainText(utterance)
+                    current_history = self.codex_utterance_history.toPlainText().splitlines()
+                    current_history.append(utterance)
+                    self.codex_utterance_history.setPlainText("\n".join(current_history[-10:]))
+            current = self.codex_watch_status.toPlainText()
+            lines = ([current] if current else []) + [log_message]
+            self.codex_watch_status.setPlainText("\n".join("\n".join(lines).splitlines()[-120:]))
+            self.codex_watch_status.verticalScrollBar().setValue(self.codex_watch_status.verticalScrollBar().maximum())
         if event_name.startswith("presentation_") and event_name != "presentation_buffering_progress":
             self.refresh_present_sessions()
 
@@ -814,8 +952,111 @@ class MainWindow(QMainWindow):
         if status_info.get("paused") is not None:
             lines.append(f"**Paused:** {'Yes' if status_info.get('paused') else 'No'}")
         if status_info.get("queued") is not None:
-            lines.append(f"**Queued motions:** {status_info.get("queued")}")
+            lines.append(f"**Queued motions:** {status_info.get('queued')}")
         self.present_status.setPlainText("\n".join(lines))
+
+    def refresh_codex_sessions(self):
+        if self._codex_refresh_inflight:
+            return
+        self._codex_refresh_inflight = True
+        self.codex_session_list_status.setText("Session list: refreshing...")
+        worker = Worker(list_codex_sessions, DEFAULT_CONTROLLER_URL)
+        worker.signals.result.connect(self.populate_codex_sessions)
+        worker.signals.error.connect(lambda err: self.codex_session_list_status.setText(f"Session list: error: {err}"))
+        worker.signals.finished.connect(lambda: setattr(self, "_codex_refresh_inflight", False))
+        self.threadpool.start(worker)
+
+    def auto_refresh_codex_sessions(self):
+        if self._ui_updates_paused:
+            return
+        if not self.auto_refresh_codex_sessions_checkbox.isChecked():
+            return
+        self.refresh_codex_sessions()
+
+    def populate_codex_sessions(self, sessions: List[Dict[str, Any]]):
+        self.codex_sessions = {str(item.get("id")): item for item in sessions if item.get("id")}
+        current = self.codex_session_dropdown.currentData()
+        self.codex_session_dropdown.blockSignals(True)
+        self.codex_session_dropdown.clear()
+        for item in sessions:
+            session_id = item.get("id")
+            if not session_id:
+                continue
+            cwd = Path(item.get("cwd") or "").name if item.get("cwd") else "?"
+            label = f"{item.get('thread_name') or session_id} | {cwd} | {item.get('updated_at') or ''}"
+            self.codex_session_dropdown.addItem(label, str(session_id))
+        self.codex_session_dropdown.blockSignals(False)
+        if current and current in self.codex_sessions:
+            idx = self.codex_session_dropdown.findData(current)
+            if idx >= 0:
+                self.codex_session_dropdown.setCurrentIndex(idx)
+        session_ids = list(self.codex_sessions)
+        self.codex_session_list_status.setText(
+            f"Session list: {len(session_ids)} sessions loaded at {time.strftime('%H:%M:%S')}"
+        )
+        self.update_codex_session_details()
+
+    def update_codex_session_details(self):
+        session_id = self.codex_session_dropdown.currentData()
+        item = self.codex_sessions.get(str(session_id), {}) if session_id else {}
+        if not item:
+            self.codex_session_details.setPlainText("No Codex session selected.")
+            return
+        lines = [
+            f"session id: {item.get('id', session_id)}",
+            f"thread name: {item.get('thread_name', '?')}",
+            f"cwd: {item.get('cwd') or '?'}",
+            f"updated_at: {item.get('updated_at') or '?'}",
+            f"rollout path: {item.get('rollout_path') or '?'}",
+        ]
+        self.codex_session_details.setPlainText("\n".join(lines))
+
+    def submit_codex_watch(self):
+        session_id = self.codex_session_dropdown.currentData()
+        if not session_id:
+            self.codex_watch_status.setPlainText("Select a Codex session first.")
+            return
+        item = self.codex_sessions.get(str(session_id), {})
+        event_types = ["assistant_message"] if self.codex_assistant_messages_checkbox.isChecked() else []
+        payload = {
+            "mode": "codex_watch",
+            "payload": {
+                "session_id": str(session_id),
+                "rollout_path": item.get("rollout_path"),
+                "character_profile": self.codex_profile.toPlainText(),
+                "style_id": self.get_selected_style_id(),
+                "model": self.codex_model_edit.text() or "gpt-5.4-nano",
+                "event_types": event_types or ["assistant_message"],
+            },
+        }
+        worker = Worker(create_session, DEFAULT_CONTROLLER_URL, payload)
+        worker.signals.result.connect(self.codex_watch_started)
+        worker.signals.error.connect(lambda err: (self.set_codex_watch_state("error"), self.codex_watch_status.setPlainText(f"Error: {err}")))
+        self.set_codex_watch_state("starting")
+        self.threadpool.start(worker)
+
+    def codex_watch_started(self, result: Dict[str, Any]):
+        if isinstance(result, dict):
+            self.codex_watch_session_id = result.get("session", {}).get("id")
+            session_status = result.get("session", {}).get("status") or result.get("result", {}).get("status") or "unknown"
+            self.set_codex_watch_state(str(session_status))
+            self.codex_watch_status.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            self.set_codex_watch_state("unknown")
+            self.codex_watch_status.setPlainText(str(result))
+
+    def stop_codex_watch(self):
+        if not self.codex_watch_session_id:
+            self.codex_watch_status.setPlainText("No Codex Watch session is running.")
+            return
+        worker = Worker(send_command, DEFAULT_CONTROLLER_URL, self.codex_watch_session_id, "stop")
+        worker.signals.result.connect(self.codex_watch_stopped)
+        worker.signals.error.connect(lambda err: (self.set_codex_watch_state("error"), self.codex_watch_status.setPlainText(f"Error: {err}")))
+        self.threadpool.start(worker)
+
+    def codex_watch_stopped(self, result: str):
+        self.set_codex_watch_state("stopped")
+        self.codex_watch_status.setPlainText(str(result))
 
     @pyqtSlot()
     def submit_talk(self):
