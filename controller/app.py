@@ -87,7 +87,7 @@ class ControllerApp:
             description="Drive a PowerPoint-backed presentation",
             metadata={
                 "requires": ["script_path"],
-                "optional": ["ppt_path", "style_id"],
+                "optional": ["ppt_path", "style_id", "image_viewer", "loop", "loop_delay"],
                 "form": [
                     {
                         "type": "file",
@@ -104,6 +104,13 @@ class ControllerApp:
                         "required": False,
                     },
                     {
+                        "type": "select",
+                        "name": "image_viewer",
+                        "label": "Image viewer",
+                        "options": ["auto", "on", "off"],
+                        "default": "auto",
+                    },
+                    {
                         "type": "slider",
                         "name": "wait",
                         "label": "Slide delay",
@@ -111,6 +118,21 @@ class ControllerApp:
                         "maximum": 5.0,
                         "step": 0.1,
                         "default": 1.0,
+                    },
+                    {
+                        "type": "checkbox",
+                        "name": "loop",
+                        "label": "Loop presentation",
+                        "default": False,
+                    },
+                    {
+                        "type": "slider",
+                        "name": "loop_delay",
+                        "label": "Loop delay",
+                        "minimum": 0.0,
+                        "maximum": 300.0,
+                        "step": 1.0,
+                        "default": 0.0,
                     },
                     {
                         "type": "slider",

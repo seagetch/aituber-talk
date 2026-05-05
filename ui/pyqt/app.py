@@ -77,6 +77,24 @@ def send_command(controller_url: str, session_id: str, command: str) -> str:
         return data["error"]
     return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
 
+def update_settings(controller_url: str, jaw_open_scale: float, jaw_open_source_index: int) -> str:
+    data = _fetch_json(
+        "PATCH",
+        f"{controller_url}/settings",
+        json={
+            "jaw_open_scale": float(jaw_open_scale),
+            "jaw_open_source_index": int(jaw_open_source_index),
+        },
+        timeout=10,
+    )
+    if isinstance(data, dict) and "error" in data and len(data) == 1:
+        return data["error"]
+    return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
+
+def get_settings(controller_url: str) -> Dict[str, Any]:
+    data = _fetch_json("GET", f"{controller_url}/settings", timeout=5)
+    return data if isinstance(data, dict) and "error" not in data else {}
+
 def create_session(controller_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Creates a new session (talk or present)."""
     return _fetch_json("POST", f"{controller_url}/sessions", json=payload, timeout=30)
@@ -193,6 +211,17 @@ class MainWindow(QMainWindow):
         self.style_dropdown = QComboBox()
         self.speaker_style_layout.addRow("Speaker:", self.speaker_dropdown)
         self.speaker_style_layout.addRow("Style:", self.style_dropdown)
+        self.jaw_open_scale_spinbox = QDoubleSpinBox()
+        self.jaw_open_scale_spinbox.setRange(0.0, 5.0)
+        self.jaw_open_scale_spinbox.setValue(1.0)
+        self.jaw_open_scale_spinbox.setSingleStep(0.1)
+        self.speaker_style_layout.addRow("jawOpen scale:", self.jaw_open_scale_spinbox)
+        self.jaw_open_source_index_spinbox = QSpinBox()
+        self.jaw_open_source_index_spinbox.setRange(0, 63)
+        self.jaw_open_source_index_spinbox.setValue(35)
+        self.speaker_style_layout.addRow("jawOpen source index:", self.jaw_open_source_index_spinbox)
+        self.apply_motion_settings_button = QPushButton("Apply Motion Settings")
+        self.speaker_style_layout.addRow(self.apply_motion_settings_button)
         self.speaker_style_group.setLayout(self.speaker_style_layout)
         self.layout.addWidget(self.speaker_style_group)
 
@@ -213,8 +242,10 @@ class MainWindow(QMainWindow):
         self.init_sessions_tab()
         
         self.load_speakers()
+        self.load_motion_settings()
 
         self.speaker_dropdown.currentTextChanged.connect(self.update_style_choices)
+        self.apply_motion_settings_button.clicked.connect(self.apply_motion_settings)
 
         self.start_event_listener()
         self.refresh_timer = QTimer(self)
@@ -274,11 +305,25 @@ class MainWindow(QMainWindow):
         self.wait_slider.setSingleStep(0.1)
         controls_layout.addRow("Slide Delay (s):", self.wait_slider)
 
+        self.loop_checkbox = QCheckBox("Loop presentation")
+        self.loop_checkbox.setChecked(False)
+        controls_layout.addRow("Loop:", self.loop_checkbox)
+
+        self.loop_delay_slider = QDoubleSpinBox()
+        self.loop_delay_slider.setRange(0.0, 300.0)
+        self.loop_delay_slider.setValue(0.0)
+        self.loop_delay_slider.setSingleStep(1.0)
+        controls_layout.addRow("Loop Delay (s):", self.loop_delay_slider)
+
         self.timeout_slider = QDoubleSpinBox()
         self.timeout_slider.setRange(30.0, 600.0)
         self.timeout_slider.setValue(300.0)
         self.timeout_slider.setSingleStep(10.0)
         controls_layout.addRow("Slide Timeout (s):", self.timeout_slider)
+
+        self.image_viewer_mode = QComboBox()
+        self.image_viewer_mode.addItems(["auto", "on", "off"])
+        controls_layout.addRow("Image Viewer:", self.image_viewer_mode)
         
         controls_group.setLayout(controls_layout)
         
@@ -388,6 +433,17 @@ class MainWindow(QMainWindow):
         worker.signals.result.connect(self.populate_speaker_dropdown)
         self.threadpool.start(worker)
 
+    def load_motion_settings(self):
+        worker = Worker(get_settings, DEFAULT_CONTROLLER_URL)
+        worker.signals.result.connect(self.populate_motion_settings)
+        self.threadpool.start(worker)
+
+    def populate_motion_settings(self, settings: Dict[str, Any]):
+        if isinstance(settings, dict) and "jaw_open_scale" in settings:
+            self.jaw_open_scale_spinbox.setValue(float(settings["jaw_open_scale"]))
+        if isinstance(settings, dict) and "jaw_open_source_index" in settings:
+            self.jaw_open_source_index_spinbox.setValue(int(settings["jaw_open_source_index"]))
+
     def populate_speaker_dropdown(self, speakers: List[Dict[str, Any]]):
         self.speakers = speakers
         if not self.speakers:
@@ -420,6 +476,17 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", filter)
         if file_path:
             line_edit.setText(file_path)
+
+    def apply_motion_settings(self):
+        worker = Worker(
+            update_settings,
+            DEFAULT_CONTROLLER_URL,
+            self.jaw_open_scale_spinbox.value(),
+            self.jaw_open_source_index_spinbox.value(),
+        )
+        worker.signals.result.connect(lambda res: self.talk_result.setText(str(res)))
+        worker.signals.error.connect(lambda err: self.talk_result.setText(f"Error: {err}"))
+        self.threadpool.start(worker)
 
     @pyqtSlot(str, dict)
     def handle_event(self, event_name: str, payload: dict):
@@ -474,6 +541,12 @@ class MainWindow(QMainWindow):
         slides_total = status_info.get("slides_total") or metadata.get("slides_total")
         current_slide = status_info.get("current_slide") or 0
         lines.append(f"**Slides:** {current_slide}/{slides_total or '?'}")
+        if status_info.get("loop") or metadata.get("loop"):
+            loop_count = status_info.get("loop_count") or 1
+            loop_delay = status_info.get("loop_delay", metadata.get("loop_delay", 0))
+            lines.append(f"**Loop:** On (cycle {loop_count}, delay {loop_delay}s)")
+        else:
+            lines.append("**Loop:** Off")
         title = status_info.get("current_title")
         if title:
             lines.append(f"**Slide title:** {title}")
@@ -554,6 +627,9 @@ class MainWindow(QMainWindow):
                 "wait": self.wait_slider.value(),
                 "timeout": self.timeout_slider.value(),
                 "style_id": self.get_selected_style_id(),
+                "image_viewer": self.image_viewer_mode.currentText(),
+                "loop": self.loop_checkbox.isChecked(),
+                "loop_delay": self.loop_delay_slider.value(),
             },
         }
         if ppt_server_path:

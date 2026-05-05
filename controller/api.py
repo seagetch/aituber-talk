@@ -29,6 +29,11 @@ class SessionCommandRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
+class SettingsUpdateRequest(BaseModel):
+    jaw_open_scale: Optional[float] = None
+    jaw_open_source_index: Optional[int] = None
+
+
 def attach_routes(app: FastAPI, controller) -> None:
     router = APIRouter()
 
@@ -39,6 +44,28 @@ def attach_routes(app: FastAPI, controller) -> None:
     @router.get("/modes")
     async def list_modes() -> Dict[str, Any]:
         return {"modes": list(controller.registry.list_modes().values())}
+
+    @router.get("/settings")
+    async def get_settings() -> Dict[str, Any]:
+        return {
+            "jaw_open_scale": controller.engine.config.jaw_open_scale,
+            "jaw_open_source_index": controller.engine.config.jaw_open_source_index,
+        }
+
+    @router.patch("/settings")
+    async def update_settings(req: SettingsUpdateRequest) -> Dict[str, Any]:
+        if req.jaw_open_scale is not None:
+            if req.jaw_open_scale < 0:
+                raise HTTPException(status_code=400, detail="jaw_open_scale must be 0 or greater")
+            controller.engine.set_jaw_open_scale(req.jaw_open_scale)
+        if req.jaw_open_source_index is not None:
+            if not 0 <= req.jaw_open_source_index < 64:
+                raise HTTPException(status_code=400, detail="jaw_open_source_index must be between 0 and 63")
+            controller.engine.set_jaw_open_source_index(req.jaw_open_source_index)
+        return {
+            "jaw_open_scale": controller.engine.config.jaw_open_scale,
+            "jaw_open_source_index": controller.engine.config.jaw_open_source_index,
+        }
 
 
     @router.post("/files")
@@ -187,5 +214,3 @@ def attach_routes(app: FastAPI, controller) -> None:
 
 
 __all__ = ["attach_routes", "SessionCreateRequest", "SessionCommandRequest"]
-
-

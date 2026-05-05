@@ -20,6 +20,9 @@ def submit_presentation(
     style_id: Optional[int],
     wait_seconds: float,
     timeout_sec: float,
+    image_viewer: str = "auto",
+    loop: bool = False,
+    loop_delay: float = 0.0,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "mode": "present",
@@ -27,6 +30,9 @@ def submit_presentation(
             "script_path": str(script_path),
             "wait": wait_seconds,
             "timeout": timeout_sec,
+            "image_viewer": image_viewer,
+            "loop": loop,
+            "loop_delay": loop_delay,
         },
     }
     if ppt_path is not None:
@@ -62,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--style_id", type=int, default=None, help="Voice style ID override")
     parser.add_argument("--wait", type=float, default=1.0, help="Delay between slides (seconds)")
     parser.add_argument("--timeout", type=float, default=300.0, help="Speech completion timeout per slide")
+    parser.set_defaults(image_viewer="auto")
+    parser.add_argument("--img", "--image-viewer", dest="image_viewer", action="store_const", const="on", help="Show Markdown images while presenting")
+    parser.add_argument("--no-img", "--no-image-viewer", dest="image_viewer", action="store_const", const="off", help="Disable Markdown image viewer")
+    parser.add_argument("--loop", action="store_true", help="Loop the presentation until stopped")
+    parser.add_argument("--loop-delay", type=float, default=0.0, help="Delay before restarting the presentation loop (seconds)")
     parser.add_argument("--controller", default=DEFAULT_CONTROLLER_URL, help="Controller base URL")
     parser.add_argument("--follow", action="store_true", help="Poll the session status until completion")
     return parser.parse_args()
@@ -83,6 +94,9 @@ def main() -> None:
             args.style_id,
             args.wait,
             args.timeout,
+            args.image_viewer,
+            args.loop,
+            args.loop_delay,
         )
     except requests.HTTPError as exc:
         raise SystemExit(f"Failed to submit presentation: {exc}") from exc

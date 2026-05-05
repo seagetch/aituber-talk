@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-port", type=int, default=8001, help="Controller bind port")
     parser.add_argument("--ui-host", default="127.0.0.1", help="UI bind host")
     parser.add_argument("--device", default="auto", help="PyTorch device (auto, cpu, cuda, cuda:0, mps, etc.)")
+    parser.add_argument("--jaw-open-scale", type=float, default=1.0, help="Scale applied to the jawOpen blendshape before VMC output")
+    parser.add_argument("--jaw-open-source-index", type=int, default=35, help="SadTalker expression index used as jawOpen source")
     parser.add_argument("--list-devices", action="store_true", help="List detected PyTorch devices and exit")
     parser.add_argument("--ui-port", type=int, default=8000, help="UI bind port")
     parser.add_argument("--open-browser", action="store_true", help="Open browser on UI start (web UI only)")
@@ -100,7 +102,11 @@ def main() -> None:
 
     device_choice = resolve_device(args.device)
     print(f"Using TalkEngine device: {device_choice}")
-    engine_config = TalkEngineConfig(device=device_choice)
+    engine_config = TalkEngineConfig(
+        device=device_choice,
+        jaw_open_scale=max(args.jaw_open_scale, 0.0),
+        jaw_open_source_index=max(0, min(args.jaw_open_source_index, 63)),
+    )
 
     server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level, engine_config)
     

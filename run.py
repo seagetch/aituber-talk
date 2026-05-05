@@ -87,6 +87,8 @@ def build_engine_from_args(args: argparse.Namespace) -> TalkEngine:
         no_blink=args.no_blink,
         osc_host=args.osc_host,
         osc_port=args.osc_port,
+        jaw_open_scale=args.jaw_open_scale,
+        jaw_open_source_index=args.jaw_open_source_index,
     )
     return TalkEngine(config)
 
@@ -101,6 +103,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no_blink", action="store_true", help="Disable blink animation")
     parser.add_argument("--osc_host", default=defaults.osc_host)
     parser.add_argument("--osc_port", type=int, default=defaults.osc_port)
+    parser.add_argument("--jaw-open-scale", type=float, default=defaults.jaw_open_scale)
+    parser.add_argument("--jaw-open-source-index", type=int, default=defaults.jaw_open_source_index)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=34512)
     return parser.parse_args(argv)

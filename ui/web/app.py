@@ -88,6 +88,24 @@ def send_command(controller_url: str, session_id: str, command: str) -> str:
         return data["error"]
     return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
 
+def update_settings(controller_url: str, jaw_open_scale: float, jaw_open_source_index: int) -> str:
+    data = _fetch_json(
+        "PATCH",
+        f"{controller_url}/settings",
+        json={
+            "jaw_open_scale": float(jaw_open_scale),
+            "jaw_open_source_index": int(jaw_open_source_index),
+        },
+        timeout=10,
+    )
+    if isinstance(data, dict) and "error" in data and len(data) == 1:
+        return data["error"]
+    return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
+
+def get_settings(controller_url: str) -> Dict[str, Any]:
+    data = _fetch_json("GET", f"{controller_url}/settings", timeout=5)
+    return data if isinstance(data, dict) and "error" not in data else {}
+
 def create_session(controller_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return _fetch_json("POST", f"{controller_url}/sessions", json=payload, timeout=30)
 
@@ -139,6 +157,8 @@ PRESENT_EVENT_TYPES = {
     "presentation_started",
     "presentation_slide_started",
     "presentation_slide_completed",
+    "presentation_image_shown",
+    "presentation_loop_waiting",
     "presentation_finished",
     "presentation_error",
     "presentation_stopped",
@@ -233,6 +253,9 @@ def render_present_cards(details: Dict[str, Dict[str, Any]], selected_id: Option
         flags: List[str] = []
         if current_title:
             flags.append(f"<span class='session-flag'>Slide: {current_title}</span>")
+        loop_count = status_info.get("loop_count")
+        if status_info.get("loop") or metadata.get("loop"):
+            flags.append(f"<span class='session-flag'>Loop: {loop_count or 1}</span>")
         if status_info.get("paused"):
             flags.append("<span class='session-flag'>Paused</span>")
         queued = status_info.get("queued")
@@ -276,6 +299,12 @@ def format_present_status(detail: Dict[str, Any]) -> str:
     slides_total = status_info.get("slides_total") or metadata.get("slides_total")
     current_slide = status_info.get("current_slide") or 0
     lines.append(f"**Slides:** {current_slide}/{slides_total or '?'}")
+    if status_info.get("loop") or metadata.get("loop"):
+        loop_count = status_info.get("loop_count") or 1
+        loop_delay = status_info.get("loop_delay", metadata.get("loop_delay", 0))
+        lines.append(f"**Loop:** On (cycle {loop_count}, delay {loop_delay}s)")
+    else:
+        lines.append("**Loop:** Off")
     title = status_info.get("current_title")
     if title:
         lines.append(f"**Slide title:** {title}")
@@ -353,6 +382,9 @@ def build_ui(
             script_choice: Optional[str],
             ppt_upload: Optional[str],
             ppt_choice: Optional[str],
+            image_viewer: str,
+            loop: bool,
+            loop_delay: float,
             wait_seconds: float,
             timeout_seconds: float,
             uploads_cache: Optional[List[Dict[str, Any]]],
@@ -393,6 +425,9 @@ def build_ui(
                     "wait": float(wait_seconds),
                     "timeout": float(timeout_seconds),
                     "style_id": style_id,
+                    "image_viewer": image_viewer or "auto",
+                    "loop": bool(loop),
+                    "loop_delay": float(loop_delay),
                 },
             }
             if ppt_server_path:
@@ -491,6 +526,10 @@ def build_ui(
                     summary = f"slide={payload.get('slide')} title={payload.get('title') or '?'}"
                 elif event_name == "presentation_slide_completed":
                     summary = f"slide={payload.get('slide')} status={payload.get('status')}"
+                elif event_name == "presentation_image_shown":
+                    summary = f"slide={payload.get('slide')} image={Path(str(payload.get('image') or '')).name or '?'}"
+                elif event_name == "presentation_loop_waiting":
+                    summary = f"loop={payload.get('loop')} delay={payload.get('delay')}"
                 elif event_name == "presentation_finished":
                     summary = f"status={payload.get('status')} slides={payload.get('slides')}"
                 elif event_name == "presentation_error":
@@ -718,6 +757,7 @@ def build_ui(
             except Exception as exc:
                 return f"Error: {exc}"
         
+        settings = get_settings(controller_url)
         demo = gr.Blocks(title="AITuber Controller UI")
         with demo:
             gr.HTML(STYLE)
@@ -729,6 +769,20 @@ def build_ui(
             with gr.Row():
                 speaker_dropdown = gr.Dropdown(choices=speaker_names, value=default_speaker, label="Speaker")
                 style_dropdown = gr.Dropdown(choices=initial_styles, value=default_style_choice, label="Style")
+                jaw_open_scale = gr.Slider(
+                    label="jawOpen scale",
+                    minimum=0.0,
+                    maximum=5.0,
+                    value=float(settings.get("jaw_open_scale", 1.0)),
+                    step=0.1,
+                )
+                jaw_open_source_index = gr.Number(
+                    label="jawOpen source index",
+                    value=int(settings.get("jaw_open_source_index", 35)),
+                    precision=0,
+                )
+                apply_settings_button = gr.Button("Apply motion settings", variant="secondary")
+                motion_settings_result = gr.Textbox(label="Motion Settings Result", interactive=False)
                 speaker_dropdown.change(
                     lambda name: gr.update(
                         choices=(choices := style_choices(name)),
@@ -736,6 +790,11 @@ def build_ui(
                     ),
                     inputs=[speaker_dropdown],
                     outputs=[style_dropdown],
+                )
+                apply_settings_button.click(
+                    lambda scale, source_index: update_settings(controller_url, scale, source_index),
+                    inputs=[jaw_open_scale, jaw_open_source_index],
+                    outputs=motion_settings_result,
                 )
 
             with gr.Tabs():
@@ -769,7 +828,14 @@ def build_ui(
 
                     upload_feedback = gr.Markdown("")
 
+                    image_viewer_mode = gr.Radio(
+                        label="Image viewer",
+                        choices=["auto", "on", "off"],
+                        value="auto",
+                    )
                     wait_slider = gr.Slider(label="Slide delay (seconds)", minimum=0.0, maximum=5.0, value=1.0, step=0.1)
+                    loop_checkbox = gr.Checkbox(label="Loop presentation", value=False)
+                    loop_delay_slider = gr.Slider(label="Loop delay (seconds)", minimum=0.0, maximum=300.0, value=0.0, step=1.0)
                     timeout_slider = gr.Slider(label="Slide timeout (seconds)", minimum=30.0, maximum=600.0, value=300.0, step=10.0)
                     present_button = gr.Button("Start Presentation")
                     present_result = gr.Textbox(label="Result", interactive=False)
@@ -787,6 +853,9 @@ def build_ui(
                             script_existing_dropdown,
                             ppt_file,
                             ppt_existing_dropdown,
+                            image_viewer_mode,
+                            loop_checkbox,
+                            loop_delay_slider,
                             wait_slider,
                             timeout_slider,
                             uploads_state,
@@ -945,4 +1014,3 @@ def build_ui(
     if __name__ == "__main__":
         ui_app = build_ui()
         ui_app.launch(server_name="0.0.0.0", server_port=8000)
-

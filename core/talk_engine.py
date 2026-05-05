@@ -19,7 +19,7 @@ import wave
 from dataclasses import dataclass, field
 from multiprocessing import Queue as MPQueue
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -258,6 +258,8 @@ AR52 = [
     "tongueOut",
 ]
 EXP_NAMES = AR52 + [f"exp{idx:02d}" for idx in range(52, 64)]
+JAW_OPEN_INDEX = EXP_NAMES.index("jawOpen")
+DEFAULT_JAW_OPEN_SOURCE_INDEX = 35
 OSC_BONE = "/VMC/Ext/Bone/Pos"
 OSC_BVAL = "/VMC/Ext/Blend/Val"
 OSC_APPL = "/VMC/Ext/Blend/Apply"
@@ -272,16 +274,43 @@ def _pose_msg(vals: Iterable[float]) -> bytes:
     return msg.build().dgram
 
 
-def map_exp(values: np.ndarray) -> np.ndarray:
-    return np.nan_to_num(np.clip(values, 0, 1), nan=0.0, posinf=1.0, neginf=0.0)
+def map_exp(
+    values: np.ndarray,
+    *,
+    jaw_open_scale: float = 1.0,
+    jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX,
+) -> np.ndarray:
+    source = np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
+    mapped = np.zeros(64, np.float32)
+    limit = min(source.shape[0], mapped.shape[0])
+    for idx in range(limit):
+        mapped[idx] = max(0.0, float(source[idx]))
+    if 0 <= jaw_open_source_index < source.shape[0]:
+        mapped[JAW_OPEN_INDEX] = max(0.0, float(source[jaw_open_source_index]))
+    if mapped.shape[0] > JAW_OPEN_INDEX:
+        mapped[JAW_OPEN_INDEX] = mapped[JAW_OPEN_INDEX] * jaw_open_scale
+    return np.clip(mapped, 0.0, 1.0)
 
 
-def send_frame(sock: SimpleUDPClient, row: np.ndarray) -> None:
+def send_frame(
+    sock: SimpleUDPClient,
+    row: np.ndarray,
+    *,
+    jaw_open_scale: float = 1.0,
+    jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX,
+) -> None:
     yaw, pitch, roll = row[64:67]
     tx, ty, tz = row[67:70]
     qx, qy, qz, qw = R.from_euler("yxz", [yaw, pitch, roll]).as_quat()
     sock._sock.sendto(_pose_msg([tx, ty, tz, qx, qy, qz, qw]), (sock._address, sock._port))
-    for name, val in zip(EXP_NAMES, map_exp(row[:64])):
+    for name, val in zip(
+        EXP_NAMES,
+        map_exp(
+            row[:64],
+            jaw_open_scale=jaw_open_scale,
+            jaw_open_source_index=jaw_open_source_index,
+        ),
+    ):
         sock.send_message(OSC_BVAL, [name, float(val)])
     sock.send_message(OSC_APPL, [])
 
@@ -299,6 +328,8 @@ class TalkEngineConfig:
     no_blink: bool = False
     osc_host: str = "127.0.0.1"
     osc_port: int = 39540
+    jaw_open_scale: float = 1.0
+    jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX
     speaker_host: str = "127.0.0.1"
     speaker_port: int = 10101
     motion_queue_size: int = 10
@@ -444,14 +475,23 @@ class TalkEngine:
                     break
         return session_id
 
-    def status(self) -> Dict[str, Optional[str]]:
+    def status(self) -> Dict[str, Any]:
         with self._state_lock:
             session = self._current_session_id
-        queued = self._motion_queue.qsize() if self._motion_queue is not None else 0
+        queued: Optional[int]
+        if self._motion_queue is None:
+            queued = 0
+        else:
+            try:
+                queued = self._motion_queue.qsize()
+            except (NotImplementedError, OSError):
+                queued = None
         return {
             "session": session,
             "paused": self._pause_event.is_set(),
             "queued": queued,
+            "jaw_open_scale": self.config.jaw_open_scale,
+            "jaw_open_source_index": self.config.jaw_open_source_index,
         }
 
     def set_style(self, style_id: int) -> None:
@@ -470,6 +510,14 @@ class TalkEngine:
                         self._idle_queue.get_nowait()
                     except queue.Empty:
                         break
+
+    def set_jaw_open_scale(self, scale: float) -> None:
+        self.config.jaw_open_scale = max(float(scale), 0.0)
+
+    def set_jaw_open_source_index(self, index: int) -> None:
+        if not 0 <= int(index) < 64:
+            raise ValueError("jaw_open_source_index must be between 0 and 63")
+        self.config.jaw_open_source_index = int(index)
 
     # ------------------------------------------------------------------
     # Worker loops
@@ -596,7 +644,12 @@ class TalkEngine:
                             break
                         while self._pause_event.is_set() and not self._stop_event.is_set():
                             time.sleep(0.1)
-                        send_frame(self._sock, coeff_idle[idx])
+                        send_frame(
+                            self._sock,
+                            coeff_idle[idx],
+                            jaw_open_scale=self.config.jaw_open_scale,
+                            jaw_open_source_index=self.config.jaw_open_source_index,
+                        )
                         time.sleep(dt)
                     continue
 
@@ -631,14 +684,24 @@ class TalkEngine:
                         while index < frames and now >= next_tick:
                             while self._pause_event.is_set() and not self._stop_event.is_set():
                                 time.sleep(0.1)
-                            send_frame(self._sock, coeff[index])
+                            send_frame(
+                                self._sock,
+                                coeff[index],
+                                jaw_open_scale=self.config.jaw_open_scale,
+                                jaw_open_source_index=self.config.jaw_open_source_index,
+                            )
                             index += 1
                             next_tick += dt
                         time.sleep(0.001)
                     while index < frames and not self._stop_event.is_set():
                         while self._pause_event.is_set() and not self._stop_event.is_set():
                             time.sleep(0.1)
-                        send_frame(self._sock, coeff[index])
+                        send_frame(
+                            self._sock,
+                            coeff[index],
+                            jaw_open_scale=self.config.jaw_open_scale,
+                            jaw_open_source_index=self.config.jaw_open_source_index,
+                        )
                         index += 1
                 finally:
                     os.unlink(str(wav_path))
