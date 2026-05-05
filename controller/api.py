@@ -32,6 +32,8 @@ class SessionCommandRequest(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     jaw_open_scale: Optional[float] = None
     jaw_open_source_index: Optional[int] = None
+    jaw_open_zero_value: Optional[float] = None
+    jaw_open_one_value: Optional[float] = None
 
 
 def attach_routes(app: FastAPI, controller) -> None:
@@ -47,9 +49,14 @@ def attach_routes(app: FastAPI, controller) -> None:
 
     @router.get("/settings")
     async def get_settings() -> Dict[str, Any]:
+        engine_status = controller.engine.status()
         return {
             "jaw_open_scale": controller.engine.config.jaw_open_scale,
             "jaw_open_source_index": controller.engine.config.jaw_open_source_index,
+            "jaw_open_zero_value": controller.engine.config.jaw_open_zero_value,
+            "jaw_open_one_value": controller.engine.config.jaw_open_one_value,
+            "jaw_open_current_source": engine_status.get("jaw_open_current_source"),
+            "jaw_open_current_value": engine_status.get("jaw_open_current_value"),
         }
 
     @router.patch("/settings")
@@ -62,9 +69,31 @@ def attach_routes(app: FastAPI, controller) -> None:
             if not 0 <= req.jaw_open_source_index < 64:
                 raise HTTPException(status_code=400, detail="jaw_open_source_index must be between 0 and 63")
             controller.engine.set_jaw_open_source_index(req.jaw_open_source_index)
+        if req.jaw_open_zero_value is not None or req.jaw_open_one_value is not None:
+            zero_value = (
+                req.jaw_open_zero_value
+                if req.jaw_open_zero_value is not None
+                else controller.engine.config.jaw_open_zero_value
+            )
+            one_value = (
+                req.jaw_open_one_value
+                if req.jaw_open_one_value is not None
+                else controller.engine.config.jaw_open_one_value
+            )
+            if one_value <= zero_value:
+                raise HTTPException(
+                    status_code=400,
+                    detail="jaw_open_one_value must be greater than jaw_open_zero_value",
+                )
+            controller.engine.set_jaw_open_range(zero_value, one_value)
+        engine_status = controller.engine.status()
         return {
             "jaw_open_scale": controller.engine.config.jaw_open_scale,
             "jaw_open_source_index": controller.engine.config.jaw_open_source_index,
+            "jaw_open_zero_value": controller.engine.config.jaw_open_zero_value,
+            "jaw_open_one_value": controller.engine.config.jaw_open_one_value,
+            "jaw_open_current_source": engine_status.get("jaw_open_current_source"),
+            "jaw_open_current_value": engine_status.get("jaw_open_current_value"),
         }
 
 
@@ -133,7 +162,8 @@ def attach_routes(app: FastAPI, controller) -> None:
             controller.sessions.update_status(session.id, "error")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         status = result.get("status", "running")
-        controller.sessions.update_status(session.id, status)
+        if session.status in {"created", status}:
+            controller.sessions.update_status(session.id, status)
         return {"session": session.as_dict(), "result": result}
 
     @router.get("/sessions")
@@ -166,6 +196,13 @@ def attach_routes(app: FastAPI, controller) -> None:
             if result is None:
                 raise HTTPException(status_code=400, detail="Nothing to resume")
             controller.sessions.update_status(session.id, "running")
+        elif command == "play":
+            play = getattr(mode, "play", None)
+            if play is None:
+                raise HTTPException(status_code=400, detail="Mode does not support play")
+            result = play(session)
+            if result is None:
+                raise HTTPException(status_code=400, detail="Nothing to play")
         elif command == "stop":
             result = mode.stop(session)
             if result is None:
@@ -201,6 +238,7 @@ def attach_routes(app: FastAPI, controller) -> None:
                         raise
 
                     if item is None:
+                        yield ": heartbeat\n\n"
                         continue
                     event_type, payload = item
                     chunk = f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"

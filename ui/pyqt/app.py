@@ -15,13 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple, Iterator
 
 import requests
 from PyQt6.QtCore import (
-    QObject, QRunnable, QThreadPool, pyqtSignal,
+    QEvent, QObject, QRunnable, QThreadPool, pyqtSignal,
     pyqtSlot, QThread, QTimer)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QTabWidget, QTextEdit,
+    QProgressBar, QPushButton, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget)
 from requests import exceptions as requests_exceptions
 
@@ -77,13 +77,21 @@ def send_command(controller_url: str, session_id: str, command: str) -> str:
         return data["error"]
     return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
 
-def update_settings(controller_url: str, jaw_open_scale: float, jaw_open_source_index: int) -> str:
+def update_settings(
+    controller_url: str,
+    jaw_open_scale: float,
+    jaw_open_source_index: int,
+    jaw_open_zero_value: float,
+    jaw_open_one_value: float,
+) -> str:
     data = _fetch_json(
         "PATCH",
         f"{controller_url}/settings",
         json={
             "jaw_open_scale": float(jaw_open_scale),
             "jaw_open_source_index": int(jaw_open_source_index),
+            "jaw_open_zero_value": float(jaw_open_zero_value),
+            "jaw_open_one_value": float(jaw_open_one_value),
         },
         timeout=10,
     )
@@ -105,7 +113,7 @@ def _iter_controller_events(base_url: str, stop_event: threading.Event) -> Itera
     backoff = 1.0
     while not stop_event.is_set():
         try:
-            with requests.get(endpoint, stream=True, timeout=(5, 65), headers=headers) as resp:
+            with requests.get(endpoint, stream=True, timeout=(5, 10), headers=headers) as resp:
                 resp.raise_for_status()
                 yield "__connected__", {}
                 event_name: Optional[str] = None
@@ -131,6 +139,12 @@ def _iter_controller_events(base_url: str, stop_event: threading.Event) -> Itera
                     elif line.startswith("data:"):
                         data_lines.append(line[len("data:") :].lstrip())
             backoff = 1.0
+        except requests_exceptions.ReadTimeout:
+            if stop_event.is_set():
+                return
+            yield "__timeout__", {}
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 30.0)
         except (requests.RequestException, json.JSONDecodeError) as exc:
             if stop_event.is_set():
                 return
@@ -159,7 +173,6 @@ class EventStreamListener(QThread):
 
     def stop(self):
         """Sets an event to gracefully stop the thread."""
-        self.newEvent.emit("__log__", {"message": "Stopping event stream listener..."})
         self._stop_event.set()
 
 # --- Worker Thread for non-blocking requests ---
@@ -200,6 +213,15 @@ class MainWindow(QMainWindow):
         self.event_log_deque = deque(maxlen=200)
         self.speakers = []
         self.facetracker_session_id: Optional[str] = None
+        self._motion_settings_loaded = False
+        self._settings_inflight = False
+        self._present_refresh_inflight = False
+        self._present_refresh_pending = False
+        self._present_status_inflight = False
+        self._present_status_pending = False
+        self._last_progress_log_at = 0.0
+        self._ui_updates_paused = False
+        self._event_listener_connected = False
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -220,6 +242,18 @@ class MainWindow(QMainWindow):
         self.jaw_open_source_index_spinbox.setRange(0, 63)
         self.jaw_open_source_index_spinbox.setValue(35)
         self.speaker_style_layout.addRow("jawOpen source index:", self.jaw_open_source_index_spinbox)
+        self.jaw_open_zero_value_spinbox = QDoubleSpinBox()
+        self.jaw_open_zero_value_spinbox.setRange(-10.0, 10.0)
+        self.jaw_open_zero_value_spinbox.setValue(0.0)
+        self.jaw_open_zero_value_spinbox.setSingleStep(0.01)
+        self.speaker_style_layout.addRow("source <= this gives jawOpen 0:", self.jaw_open_zero_value_spinbox)
+        self.jaw_open_one_value_spinbox = QDoubleSpinBox()
+        self.jaw_open_one_value_spinbox.setRange(-10.0, 10.0)
+        self.jaw_open_one_value_spinbox.setValue(0.15)
+        self.jaw_open_one_value_spinbox.setSingleStep(0.01)
+        self.speaker_style_layout.addRow("source >= this gives jawOpen 1:", self.jaw_open_one_value_spinbox)
+        self.jaw_open_current_label = QLabel("jawOpen current: source ? -> value ?; applied range: <= ? => 0, >= ? => 1")
+        self.speaker_style_layout.addRow(self.jaw_open_current_label)
         self.apply_motion_settings_button = QPushButton("Apply Motion Settings")
         self.speaker_style_layout.addRow(self.apply_motion_settings_button)
         self.speaker_style_group.setLayout(self.speaker_style_layout)
@@ -251,13 +285,56 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_present_sessions)
         self.refresh_timer.start(5000)
+        self.motion_settings_timer = QTimer(self)
+        self.motion_settings_timer.timeout.connect(self.load_motion_settings)
+        self.motion_settings_timer.start(1000)
 
     def closeEvent(self, event):
         """Signal background threads to stop and trigger app exit."""
         self.refresh_timer.stop()
-        self.event_listener.stop()  # Set the stop flag
+        self.motion_settings_timer.stop()
+        self.event_listener.stop()
+        self.event_listener.wait(1000)
+        if self.event_listener.isRunning():
+            self.event_listener.terminate()
+            self.event_listener.wait(1000)
+        self.threadpool.clear()
         QApplication.instance().quit()  # Exit the event loop immediately
         super().closeEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            minimized = self.isMinimized()
+            if minimized:
+                self.pause_ui_updates()
+            else:
+                self.resume_ui_updates()
+        super().changeEvent(event)
+
+    def pause_ui_updates(self):
+        if self._ui_updates_paused:
+            return
+        self._ui_updates_paused = True
+        self.refresh_timer.stop()
+        self.motion_settings_timer.stop()
+        if self._event_listener_connected:
+            try:
+                self.event_listener.newEvent.disconnect(self.handle_event)
+            except TypeError:
+                pass
+            self._event_listener_connected = False
+
+    def resume_ui_updates(self):
+        if not self._ui_updates_paused:
+            return
+        if not self._event_listener_connected:
+            self.event_listener.newEvent.connect(self.handle_event)
+            self._event_listener_connected = True
+        self._ui_updates_paused = False
+        self.refresh_timer.start(5000)
+        self.motion_settings_timer.start(1000)
+        self.refresh_present_sessions()
+        self.load_motion_settings()
 
     def init_talk_tab(self):
         layout = QVBoxLayout(self.talk_tab)
@@ -315,6 +392,13 @@ class MainWindow(QMainWindow):
         self.loop_delay_slider.setSingleStep(1.0)
         controls_layout.addRow("Loop Delay (s):", self.loop_delay_slider)
 
+        self.all_buffered_checkbox = QCheckBox("All Buffered Mode")
+        self.all_buffered_checkbox.setChecked(False)
+        self.all_buffered_checkbox.toggled.connect(
+            lambda enabled: self.start_present_button.setText("Prepare Presentation" if enabled else "Start Presentation")
+        )
+        controls_layout.addRow("All Buffered:", self.all_buffered_checkbox)
+
         self.timeout_slider = QDoubleSpinBox()
         self.timeout_slider.setRange(30.0, 600.0)
         self.timeout_slider.setValue(300.0)
@@ -345,12 +429,16 @@ class MainWindow(QMainWindow):
         self.present_session_dropdown.currentTextChanged.connect(self.update_present_status_display)
 
         session_controls_layout = QHBoxLayout()
+        self.play_buffered_btn = QPushButton("Play Buffered Presentation")
+        self.play_buffered_btn.setEnabled(False)
         self.pause_btn = QPushButton("Pause")
         self.resume_btn = QPushButton("Resume")
         self.stop_btn = QPushButton("Stop")
+        self.play_buffered_btn.clicked.connect(lambda: self.send_present_command("play"))
         self.pause_btn.clicked.connect(lambda: self.send_present_command("pause"))
         self.resume_btn.clicked.connect(lambda: self.send_present_command("resume"))
         self.stop_btn.clicked.connect(lambda: self.send_present_command("stop"))
+        session_controls_layout.addWidget(self.play_buffered_btn)
         session_controls_layout.addWidget(self.pause_btn)
         session_controls_layout.addWidget(self.resume_btn)
         session_controls_layout.addWidget(self.stop_btn)
@@ -359,6 +447,9 @@ class MainWindow(QMainWindow):
         self.command_feedback.setReadOnly(True)
         self.present_status = QTextEdit()
         self.present_status.setReadOnly(True)
+        self.buffer_progress_bar = QProgressBar()
+        self.buffer_progress_bar.setRange(0, 100)
+        self.buffer_progress_bar.setValue(0)
         self.present_event_log = QTextEdit()
         self.present_event_log.setReadOnly(True)
 
@@ -366,6 +457,8 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.present_session_dropdown)
         status_layout.addLayout(session_controls_layout)
         status_layout.addWidget(self.command_feedback)
+        status_layout.addWidget(QLabel("All Buffered Progress:"))
+        status_layout.addWidget(self.buffer_progress_bar)
         status_layout.addWidget(QLabel("Status Details:"))
         status_layout.addWidget(self.present_status)
         status_layout.addWidget(QLabel("Event Log:"))
@@ -426,6 +519,7 @@ class MainWindow(QMainWindow):
     def start_event_listener(self):
         self.event_listener = EventStreamListener(DEFAULT_CONTROLLER_URL)
         self.event_listener.newEvent.connect(self.handle_event)
+        self._event_listener_connected = True
         self.event_listener.start()
 
     def load_speakers(self):
@@ -434,15 +528,42 @@ class MainWindow(QMainWindow):
         self.threadpool.start(worker)
 
     def load_motion_settings(self):
+        if self._ui_updates_paused:
+            return
+        if self._settings_inflight:
+            return
+        self._settings_inflight = True
         worker = Worker(get_settings, DEFAULT_CONTROLLER_URL)
         worker.signals.result.connect(self.populate_motion_settings)
+        worker.signals.finished.connect(lambda: setattr(self, "_settings_inflight", False))
         self.threadpool.start(worker)
 
     def populate_motion_settings(self, settings: Dict[str, Any]):
-        if isinstance(settings, dict) and "jaw_open_scale" in settings:
+        if self._ui_updates_paused:
+            return
+        if not isinstance(settings, dict):
+            return
+        if not self._motion_settings_loaded and "jaw_open_scale" in settings:
             self.jaw_open_scale_spinbox.setValue(float(settings["jaw_open_scale"]))
-        if isinstance(settings, dict) and "jaw_open_source_index" in settings:
+        if not self._motion_settings_loaded and "jaw_open_source_index" in settings:
             self.jaw_open_source_index_spinbox.setValue(int(settings["jaw_open_source_index"]))
+        if not self._motion_settings_loaded and "jaw_open_zero_value" in settings:
+            self.jaw_open_zero_value_spinbox.setValue(float(settings["jaw_open_zero_value"]))
+        if not self._motion_settings_loaded and "jaw_open_one_value" in settings:
+            self.jaw_open_one_value_spinbox.setValue(float(settings["jaw_open_one_value"]))
+        self._motion_settings_loaded = True
+        source = settings.get("jaw_open_current_source")
+        value = settings.get("jaw_open_current_value")
+        source_text = f"{float(source):.4f}" if source is not None else "?"
+        value_text = f"{float(value):.4f}" if value is not None else "?"
+        zero = settings.get("jaw_open_zero_value")
+        one = settings.get("jaw_open_one_value")
+        zero_text = f"{float(zero):.4f}" if zero is not None else "?"
+        one_text = f"{float(one):.4f}" if one is not None else "?"
+        self.jaw_open_current_label.setText(
+            f"jawOpen current: source {source_text} -> value {value_text}; "
+            f"applied range: <= {zero_text} => 0, >= {one_text} => 1"
+        )
 
     def populate_speaker_dropdown(self, speakers: List[Dict[str, Any]]):
         self.speakers = speakers
@@ -483,31 +604,115 @@ class MainWindow(QMainWindow):
             DEFAULT_CONTROLLER_URL,
             self.jaw_open_scale_spinbox.value(),
             self.jaw_open_source_index_spinbox.value(),
+            self.jaw_open_zero_value_spinbox.value(),
+            self.jaw_open_one_value_spinbox.value(),
         )
-        worker.signals.result.connect(lambda res: self.talk_result.setText(str(res)))
+        worker.signals.result.connect(self.motion_settings_applied)
         worker.signals.error.connect(lambda err: self.talk_result.setText(f"Error: {err}"))
         self.threadpool.start(worker)
 
+    def motion_settings_applied(self, result: str):
+        self.talk_result.setPlainText(str(result))
+        self._motion_settings_loaded = False
+        self.load_motion_settings()
+
     @pyqtSlot(str, dict)
     def handle_event(self, event_name: str, payload: dict):
+        if self._ui_updates_paused:
+            return
         timestamp = time.strftime("%H:%M:%S")
+        if event_name == "__timeout__":
+            return
+        if event_name == "presentation_buffering_progress":
+            self.apply_buffering_progress_event(payload)
+            now = time.monotonic()
+            if now - self._last_progress_log_at < 0.5:
+                return
+            self._last_progress_log_at = now
+        elif event_name == "presentation_buffering_completed":
+            self.apply_buffering_completed_event(payload)
         if event_name == "__log__":
             log_message = f"[{timestamp}] [SYSTEM] {payload.get('message')}"
         else:
             log_message = f"[{timestamp}] [{event_name}] {json.dumps(payload)}"
         self.event_log_deque.append(log_message)
-        self.present_event_log.setText("\n".join(self.event_log_deque))
+        self.present_event_log.setPlainText("\n".join(self.event_log_deque))
         self.present_event_log.verticalScrollBar().setValue(self.present_event_log.verticalScrollBar().maximum())
-        if event_name.startswith("presentation_"):
+        if event_name.startswith("presentation_") and event_name != "presentation_buffering_progress":
             self.refresh_present_sessions()
+
+    def apply_buffering_completed_event(self, payload: Dict[str, Any]) -> None:
+        if self._ui_updates_paused:
+            return
+        session_id = payload.get("session", "?")
+        slides_done = payload.get("slides_done", payload.get("slides_total", "?"))
+        slides_total = payload.get("slides_total", "?")
+        segments_done = payload.get("segments_done", "?")
+        segments_total = payload.get("segments_total", "?")
+        steps_done = payload.get("generation_steps_done", "?")
+        steps_total = payload.get("generation_steps_total", "?")
+        duration = payload.get("duration")
+        self.buffer_progress_bar.setValue(100)
+        self.play_buffered_btn.setEnabled(True)
+        lines = [
+            f"**Session:** {session_id} (ready)",
+            f"**Slides:** {slides_done}/{slides_total}",
+            (
+                f"**All Buffered:** ready "
+                f"(segments {segments_done}/{segments_total}, steps {steps_done}/{steps_total}, 100.0%)"
+            ),
+            "**Ready:** Press Play Buffered Presentation to start playback.",
+        ]
+        if duration is not None:
+            lines.append(f"**Buffered audio duration:** {float(duration):.1f}s")
+        self.present_status.setPlainText("\n".join(lines))
+
+    def apply_buffering_progress_event(self, payload: Dict[str, Any]) -> None:
+        if self._ui_updates_paused:
+            return
+        progress = float(payload.get("progress") or 0.0) * 100.0
+        self.buffer_progress_bar.setValue(int(max(0.0, min(100.0, progress))))
+        title = payload.get("title") or "?"
+        stage = payload.get("stage") or "?"
+        text = str(payload.get("text") or "").replace("\n", " ")
+        lines = [
+            f"**Session:** {payload.get('session', '?')} (buffering)",
+            f"**Slides:** {payload.get('slide', '?')}/{payload.get('slides_total', '?')}",
+            (
+                f"**All Buffered:** buffering "
+                f"(segments {payload.get('segments_done', 0)}/{payload.get('segments_total', '?')}, "
+                f"steps {payload.get('generation_steps_done', 0)}/{payload.get('generation_steps_total', '?')}, "
+                f"{progress:.1f}%)"
+            ),
+            f"**Slide title:** {title}",
+            f"**Buffering stage:** segment {payload.get('current_segment', '?')} / {payload.get('segments_total', '?')} {stage}",
+        ]
+        if text:
+            lines.append(f"**Buffering text:** {text[:160]}")
+        self.present_status.setPlainText("\n".join(lines))
 
     @pyqtSlot()
     def refresh_present_sessions(self):
+        if self._ui_updates_paused:
+            return
+        if self._present_refresh_inflight:
+            self._present_refresh_pending = True
+            return
+        self._present_refresh_inflight = True
         worker = Worker(list_present_sessions, DEFAULT_CONTROLLER_URL)
         worker.signals.result.connect(self.update_present_sessions_display)
+        worker.signals.finished.connect(self._finish_present_refresh)
         self.threadpool.start(worker)
 
+    def _finish_present_refresh(self):
+        self._present_refresh_inflight = False
+        if self._present_refresh_pending and not self._ui_updates_paused:
+            self._present_refresh_pending = False
+            self.refresh_present_sessions()
+
     def update_present_sessions_display(self, sessions: List[Dict[str, Any]]):
+        if self._ui_updates_paused:
+            return
         current_selection = self.present_session_dropdown.currentText()
         sessions.sort(key=lambda s: s.get("created_at", 0), reverse=True)
         session_ids = [s.get("id", "") for s in sessions]
@@ -519,20 +724,36 @@ class MainWindow(QMainWindow):
             self.present_session_dropdown.setCurrentText(current_selection)
         elif session_ids:
             self.present_session_dropdown.setCurrentIndex(0)
+        self.play_buffered_btn.setEnabled(False)
         self.update_present_status_display()
 
     def update_present_status_display(self):
+        if self._ui_updates_paused:
+            return
         session_id = self.present_session_dropdown.currentText()
         if not session_id:
             self.present_status.clear()
             return
+        if self._present_status_inflight:
+            self._present_status_pending = True
+            return
+        self._present_status_inflight = True
         worker = Worker(get_session_status, DEFAULT_CONTROLLER_URL, session_id)
         worker.signals.result.connect(self.format_and_display_status)
+        worker.signals.finished.connect(self._finish_present_status)
         self.threadpool.start(worker)
 
+    def _finish_present_status(self):
+        self._present_status_inflight = False
+        if self._present_status_pending and not self._ui_updates_paused:
+            self._present_status_pending = False
+            self.update_present_status_display()
+
     def format_and_display_status(self, detail: Dict[str, Any]):
+        if self._ui_updates_paused:
+            return
         if not isinstance(detail, dict) or "error" in detail:
-            self.present_status.setText(json.dumps(detail, indent=2))
+            self.present_status.setPlainText(json.dumps(detail, indent=2))
             return
         session = detail.get("session", {}) or {}
         status_info = detail.get("status", {}) or {}
@@ -547,6 +768,36 @@ class MainWindow(QMainWindow):
             lines.append(f"**Loop:** On (cycle {loop_count}, delay {loop_delay}s)")
         else:
             lines.append("**Loop:** Off")
+        buffering = status_info.get("buffering", {}) or {}
+        if buffering.get("enabled") or status_info.get("all_buffered") or metadata.get("all_buffered"):
+            buffer_status = buffering.get("status") or status_info.get("buffer_status") or metadata.get("buffer_status") or "unknown"
+            buffer_done = buffering.get("slides_done", status_info.get("buffer_done", metadata.get("buffer_done", 0)))
+            buffer_total = buffering.get("slides_total", status_info.get("buffer_total", metadata.get("buffer_total", slides_total or 0)))
+            segments_done = buffering.get("segments_done", status_info.get("segments_done", metadata.get("segments_done", 0)))
+            segments_total = buffering.get("segments_total", status_info.get("segments_total", metadata.get("segments_total", 0)))
+            steps_done = buffering.get("generation_steps_done", status_info.get("generation_steps_done", metadata.get("generation_steps_done", 0)))
+            steps_total = buffering.get("generation_steps_total", status_info.get("generation_steps_total", metadata.get("generation_steps_total", 0)))
+            stage = buffering.get("stage") or status_info.get("generation_stage") or metadata.get("generation_stage")
+            current_segment = buffering.get("current_segment") or status_info.get("current_segment") or metadata.get("current_segment")
+            current_text = buffering.get("current_segment_text") or status_info.get("current_segment_text") or metadata.get("current_segment_text")
+            buffer_progress = float(buffering.get("progress", status_info.get("buffer_progress") or 0.0)) * 100.0
+            self.buffer_progress_bar.setValue(int(max(0.0, min(100.0, buffer_progress))))
+            self.play_buffered_btn.setEnabled(buffer_status in {"ready", "completed"})
+            lines.append(
+                f"**All Buffered:** {buffer_status} "
+                f"(slides {buffer_done}/{buffer_total}, segments {segments_done}/{segments_total}, "
+                f"steps {steps_done}/{steps_total}, {buffer_progress:.1f}%)"
+            )
+            if buffer_status in {"ready", "completed"}:
+                lines.append("**Ready:** Press Play Buffered Presentation to start playback.")
+            if stage:
+                lines.append(f"**Buffering stage:** segment {current_segment or '?'} / {segments_total or '?'} {stage}")
+            if current_text:
+                preview = str(current_text).replace("\n", " ")
+                lines.append(f"**Buffering text:** {preview[:160]}")
+        else:
+            self.buffer_progress_bar.setValue(0)
+            self.play_buffered_btn.setEnabled(False)
         title = status_info.get("current_title")
         if title:
             lines.append(f"**Slide title:** {title}")
@@ -554,11 +805,17 @@ class MainWindow(QMainWindow):
         lines.append(f"**Script:** {script_name}")
         ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "?"
         lines.append(f"**PowerPoint:** {ppt_name}")
+        current_source = status_info.get("jaw_open_current_source")
+        current_value = status_info.get("jaw_open_current_value")
+        if current_source is not None or current_value is not None:
+            source_text = f"{float(current_source):.4f}" if current_source is not None else "?"
+            value_text = f"{float(current_value):.4f}" if current_value is not None else "?"
+            lines.append(f"**jawOpen current:** source {source_text} -> value {value_text}")
         if status_info.get("paused") is not None:
-            lines.append(f"**Paused:** {'Yes' if status_info.get("paused") else 'No'}")
+            lines.append(f"**Paused:** {'Yes' if status_info.get('paused') else 'No'}")
         if status_info.get("queued") is not None:
             lines.append(f"**Queued motions:** {status_info.get("queued")}")
-        self.present_status.setText("\n".join(lines))
+        self.present_status.setPlainText("\n".join(lines))
 
     @pyqtSlot()
     def submit_talk(self):
@@ -630,6 +887,7 @@ class MainWindow(QMainWindow):
                 "image_viewer": self.image_viewer_mode.currentText(),
                 "loop": self.loop_checkbox.isChecked(),
                 "loop_delay": self.loop_delay_slider.value(),
+                "all_buffered": self.all_buffered_checkbox.isChecked(),
             },
         }
         if ppt_server_path:
@@ -656,9 +914,13 @@ class MainWindow(QMainWindow):
             self.command_feedback.setText("No session selected.")
             return
         worker = Worker(send_command, DEFAULT_CONTROLLER_URL, session_id, command)
-        worker.signals.result.connect(lambda res: self.command_feedback.setText(str(res)))
+        worker.signals.result.connect(self.present_command_applied)
         worker.signals.error.connect(lambda err: self.command_feedback.setText(f"Error: {err}"))
         self.threadpool.start(worker)
+
+    def present_command_applied(self, result: str):
+        self.command_feedback.setText(str(result))
+        self.refresh_present_sessions()
 
     @pyqtSlot()
     def start_facetracker(self):

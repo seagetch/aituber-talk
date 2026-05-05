@@ -16,10 +16,11 @@ import tempfile
 import threading
 import time
 import wave
+from io import BytesIO
 from dataclasses import dataclass, field
 from multiprocessing import Queue as MPQueue
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -260,6 +261,8 @@ AR52 = [
 EXP_NAMES = AR52 + [f"exp{idx:02d}" for idx in range(52, 64)]
 JAW_OPEN_INDEX = EXP_NAMES.index("jawOpen")
 DEFAULT_JAW_OPEN_SOURCE_INDEX = 35
+DEFAULT_JAW_OPEN_ZERO_VALUE = 0.0
+DEFAULT_JAW_OPEN_ONE_VALUE = 0.15
 OSC_BONE = "/VMC/Ext/Bone/Pos"
 OSC_BVAL = "/VMC/Ext/Blend/Val"
 OSC_APPL = "/VMC/Ext/Blend/Apply"
@@ -279,6 +282,8 @@ def map_exp(
     *,
     jaw_open_scale: float = 1.0,
     jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX,
+    jaw_open_zero_value: float = DEFAULT_JAW_OPEN_ZERO_VALUE,
+    jaw_open_one_value: float = DEFAULT_JAW_OPEN_ONE_VALUE,
 ) -> np.ndarray:
     source = np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
     mapped = np.zeros(64, np.float32)
@@ -286,10 +291,34 @@ def map_exp(
     for idx in range(limit):
         mapped[idx] = max(0.0, float(source[idx]))
     if 0 <= jaw_open_source_index < source.shape[0]:
-        mapped[JAW_OPEN_INDEX] = max(0.0, float(source[jaw_open_source_index]))
+        src = float(source[jaw_open_source_index])
+        denom = jaw_open_one_value - jaw_open_zero_value
+        if denom <= 1e-6:
+            mapped[JAW_OPEN_INDEX] = 0.0
+        else:
+            mapped[JAW_OPEN_INDEX] = (src - jaw_open_zero_value) / denom
     if mapped.shape[0] > JAW_OPEN_INDEX:
         mapped[JAW_OPEN_INDEX] = mapped[JAW_OPEN_INDEX] * jaw_open_scale
     return np.clip(mapped, 0.0, 1.0)
+
+
+def map_jaw_open(
+    values: np.ndarray,
+    *,
+    jaw_open_scale: float = 1.0,
+    jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX,
+    jaw_open_zero_value: float = DEFAULT_JAW_OPEN_ZERO_VALUE,
+    jaw_open_one_value: float = DEFAULT_JAW_OPEN_ONE_VALUE,
+) -> Tuple[Optional[float], float]:
+    source = np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
+    if not 0 <= jaw_open_source_index < source.shape[0]:
+        return None, 0.0
+    src = float(source[jaw_open_source_index])
+    denom = jaw_open_one_value - jaw_open_zero_value
+    if denom <= 1e-6:
+        return src, 0.0
+    value = ((src - jaw_open_zero_value) / denom) * jaw_open_scale
+    return src, float(np.clip(value, 0.0, 1.0))
 
 
 def send_frame(
@@ -298,26 +327,44 @@ def send_frame(
     *,
     jaw_open_scale: float = 1.0,
     jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX,
-) -> None:
+    jaw_open_zero_value: float = DEFAULT_JAW_OPEN_ZERO_VALUE,
+    jaw_open_one_value: float = DEFAULT_JAW_OPEN_ONE_VALUE,
+) -> Tuple[Optional[float], float]:
     yaw, pitch, roll = row[64:67]
     tx, ty, tz = row[67:70]
     qx, qy, qz, qw = R.from_euler("yxz", [yaw, pitch, roll]).as_quat()
     sock._sock.sendto(_pose_msg([tx, ty, tz, qx, qy, qz, qw]), (sock._address, sock._port))
-    for name, val in zip(
-        EXP_NAMES,
-        map_exp(
-            row[:64],
-            jaw_open_scale=jaw_open_scale,
-            jaw_open_source_index=jaw_open_source_index,
-        ),
-    ):
+    mapped = map_exp(
+        row[:64],
+        jaw_open_scale=jaw_open_scale,
+        jaw_open_source_index=jaw_open_source_index,
+        jaw_open_zero_value=jaw_open_zero_value,
+        jaw_open_one_value=jaw_open_one_value,
+    )
+    for name, val in zip(EXP_NAMES, mapped):
         sock.send_message(OSC_BVAL, [name, float(val)])
     sock.send_message(OSC_APPL, [])
+    return map_jaw_open(
+        row[:64],
+        jaw_open_scale=jaw_open_scale,
+        jaw_open_source_index=jaw_open_source_index,
+        jaw_open_zero_value=jaw_open_zero_value,
+        jaw_open_one_value=jaw_open_one_value,
+    )
 
 
 # =============================================================================
 # Configuration & runtime classes
 # =============================================================================
+
+@dataclass
+class BufferedSpeechSegment:
+    request_id: str
+    text: str
+    wav: bytes
+    coeff: np.ndarray
+    duration: float
+
 
 @dataclass
 class TalkEngineConfig:
@@ -330,6 +377,8 @@ class TalkEngineConfig:
     osc_port: int = 39540
     jaw_open_scale: float = 1.0
     jaw_open_source_index: int = DEFAULT_JAW_OPEN_SOURCE_INDEX
+    jaw_open_zero_value: float = DEFAULT_JAW_OPEN_ZERO_VALUE
+    jaw_open_one_value: float = DEFAULT_JAW_OPEN_ONE_VALUE
     speaker_host: str = "127.0.0.1"
     speaker_port: int = 10101
     motion_queue_size: int = 10
@@ -352,6 +401,9 @@ class TalkEngine:
         self._idle_enabled = threading.Event()
         self._current_session_id: Optional[str] = None
         self._state_lock = threading.Lock()
+        self._jaw_open_lock = threading.Lock()
+        self._last_jaw_open_source: Optional[float] = None
+        self._last_jaw_open_value: Optional[float] = None
         self._threads: Dict[str, threading.Thread] = {}
         self._playback_events: Dict[str, threading.Event] = {}
         self._playback_counts: Dict[str, int] = {}
@@ -409,6 +461,54 @@ class TalkEngine:
     # ------------------------------------------------------------------
     # Public API used by controller plugins
     # ------------------------------------------------------------------
+    def _generate_speech_segment(
+        self,
+        sentence: str,
+        *,
+        style_id: int,
+        request_id: str,
+        on_progress: Optional[Callable[[str, str], None]] = None,
+    ) -> BufferedSpeechSegment:
+        if on_progress:
+            on_progress("tts_started", sentence)
+        wav = tts_generate(
+            sentence,
+            style=style_id,
+            host=self.config.speaker_host,
+            port=self.config.speaker_port,
+        )
+        if on_progress:
+            on_progress("tts_completed", sentence)
+        with wave.open(BytesIO(wav), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            duration = frames / rate if rate else 0.0
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        try:
+            tmp.write(wav)
+            tmp.flush()
+            if on_progress:
+                on_progress("sadtalker_started", sentence)
+            coeff = sadtalker_coeff(
+                self._image_path,
+                Path(tmp.name),
+                self.config.device,
+                self.config.pose_style,
+                self.config.no_blink,
+            )
+            if on_progress:
+                on_progress("sadtalker_completed", sentence)
+        finally:
+            tmp.close()
+            os.unlink(tmp.name)
+        return BufferedSpeechSegment(
+            request_id=request_id,
+            text=sentence,
+            wav=wav,
+            coeff=coeff,
+            duration=duration,
+        )
+
     def submit_text(self, text: str, *, style_id: Optional[int] = None, request_id: Optional[str] = None) -> str:
         if not self._started:
             self.start()
@@ -419,6 +519,74 @@ class TalkEngine:
                 self._playback_counts[req_id] = 0
         self._text_queue.put((text, style_id, req_id))
         return req_id
+
+    def prepare_text_segments(
+        self,
+        text: str,
+        *,
+        style_id: Optional[int] = None,
+        request_id: Optional[str] = None,
+        on_segment: Optional[Callable[[BufferedSpeechSegment], None]] = None,
+        on_progress: Optional[Callable[[int, str, str], None]] = None,
+    ) -> List[BufferedSpeechSegment]:
+        """Generate speech audio and SadTalker coefficients without starting playback."""
+        if not self._started:
+            self.start()
+        current_style = self._style_id if style_id is None else style_id
+        req_id = request_id or os.urandom(8).hex()
+        prepared: List[BufferedSpeechSegment] = []
+        for idx, sentence in enumerate(split_sentences(text), 1):
+            segment = self._generate_speech_segment(
+                sentence,
+                style_id=current_style,
+                request_id=f"{req_id}-{idx}",
+                on_progress=(lambda stage, text, index=idx: on_progress(index, stage, text)) if on_progress else None,
+            )
+            prepared.append(segment)
+            if on_segment:
+                on_segment(segment)
+        return prepared
+
+    def prepare_text(self, text: str, *, style_id: Optional[int] = None) -> List[Tuple[bytes, np.ndarray]]:
+        return [(segment.wav, segment.coeff) for segment in self.prepare_text_segments(text, style_id=style_id)]
+
+    def play_segments(
+        self,
+        segments: List[BufferedSpeechSegment],
+        *,
+        request_id: Optional[str] = None,
+    ) -> str:
+        if not self._started:
+            self.start()
+        req_id = request_id or os.urandom(8).hex()
+        with self._playback_lock:
+            if req_id not in self._playback_events:
+                self._playback_events[req_id] = threading.Event()
+            self._playback_counts[req_id] = len(segments)
+            if not segments:
+                self._playback_events[req_id].set()
+        if self._motion_queue is not None:
+            for segment in segments:
+                self._motion_queue.put((segment.wav, segment.coeff, req_id))
+        return req_id
+
+    def submit_prepared(
+        self,
+        items: List[Tuple[bytes, np.ndarray]],
+        *,
+        request_id: Optional[str] = None,
+    ) -> str:
+        segments = [
+            BufferedSpeechSegment(
+                request_id=f"{request_id or 'prepared'}-{idx}",
+                text="",
+                wav=wav,
+                coeff=coeff,
+                duration=0.0,
+            )
+            for idx, (wav, coeff) in enumerate(items, 1)
+        ]
+        return self.play_segments(segments, request_id=request_id)
 
     def wait_for(self, request_id: str, timeout: float = 300.0) -> str:
         with self._playback_lock:
@@ -478,6 +646,9 @@ class TalkEngine:
     def status(self) -> Dict[str, Any]:
         with self._state_lock:
             session = self._current_session_id
+        with self._jaw_open_lock:
+            jaw_open_source = self._last_jaw_open_source
+            jaw_open_value = self._last_jaw_open_value
         queued: Optional[int]
         if self._motion_queue is None:
             queued = 0
@@ -492,6 +663,10 @@ class TalkEngine:
             "queued": queued,
             "jaw_open_scale": self.config.jaw_open_scale,
             "jaw_open_source_index": self.config.jaw_open_source_index,
+            "jaw_open_zero_value": self.config.jaw_open_zero_value,
+            "jaw_open_one_value": self.config.jaw_open_one_value,
+            "jaw_open_current_source": jaw_open_source,
+            "jaw_open_current_value": jaw_open_value,
         }
 
     def set_style(self, style_id: int) -> None:
@@ -518,6 +693,17 @@ class TalkEngine:
         if not 0 <= int(index) < 64:
             raise ValueError("jaw_open_source_index must be between 0 and 63")
         self.config.jaw_open_source_index = int(index)
+
+    def set_jaw_open_range(self, zero_value: float, one_value: float) -> None:
+        if float(one_value) <= float(zero_value):
+            raise ValueError("jaw_open_one_value must be greater than jaw_open_zero_value")
+        self.config.jaw_open_zero_value = float(zero_value)
+        self.config.jaw_open_one_value = float(one_value)
+
+    def _record_jaw_open(self, source: Optional[float], value: float) -> None:
+        with self._jaw_open_lock:
+            self._last_jaw_open_source = source
+            self._last_jaw_open_value = value
 
     # ------------------------------------------------------------------
     # Worker loops
@@ -644,12 +830,15 @@ class TalkEngine:
                             break
                         while self._pause_event.is_set() and not self._stop_event.is_set():
                             time.sleep(0.1)
-                        send_frame(
+                        source, value = send_frame(
                             self._sock,
                             coeff_idle[idx],
                             jaw_open_scale=self.config.jaw_open_scale,
                             jaw_open_source_index=self.config.jaw_open_source_index,
+                            jaw_open_zero_value=self.config.jaw_open_zero_value,
+                            jaw_open_one_value=self.config.jaw_open_one_value,
                         )
+                        self._record_jaw_open(source, value)
                         time.sleep(dt)
                     continue
 
@@ -684,24 +873,30 @@ class TalkEngine:
                         while index < frames and now >= next_tick:
                             while self._pause_event.is_set() and not self._stop_event.is_set():
                                 time.sleep(0.1)
-                            send_frame(
+                            source, value = send_frame(
                                 self._sock,
                                 coeff[index],
                                 jaw_open_scale=self.config.jaw_open_scale,
                                 jaw_open_source_index=self.config.jaw_open_source_index,
+                                jaw_open_zero_value=self.config.jaw_open_zero_value,
+                                jaw_open_one_value=self.config.jaw_open_one_value,
                             )
+                            self._record_jaw_open(source, value)
                             index += 1
                             next_tick += dt
                         time.sleep(0.001)
                     while index < frames and not self._stop_event.is_set():
                         while self._pause_event.is_set() and not self._stop_event.is_set():
                             time.sleep(0.1)
-                        send_frame(
+                        source, value = send_frame(
                             self._sock,
                             coeff[index],
                             jaw_open_scale=self.config.jaw_open_scale,
                             jaw_open_source_index=self.config.jaw_open_source_index,
+                            jaw_open_zero_value=self.config.jaw_open_zero_value,
+                            jaw_open_one_value=self.config.jaw_open_one_value,
                         )
+                        self._record_jaw_open(source, value)
                         index += 1
                 finally:
                     os.unlink(str(wav_path))
@@ -723,4 +918,4 @@ class TalkEngine:
             pygame.quit()
 
 
-__all__ = ["TalkEngine", "TalkEngineConfig", "split_sentences"]
+__all__ = ["BufferedSpeechSegment", "TalkEngine", "TalkEngineConfig", "split_sentences"]

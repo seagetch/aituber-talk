@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="PyTorch device (auto, cpu, cuda, cuda:0, mps, etc.)")
     parser.add_argument("--jaw-open-scale", type=float, default=1.0, help="Scale applied to the jawOpen blendshape before VMC output")
     parser.add_argument("--jaw-open-source-index", type=int, default=35, help="SadTalker expression index used as jawOpen source")
+    parser.add_argument("--jaw-open-zero-value", type=float, default=0.0, help="Source value at or below which jawOpen output becomes 0")
+    parser.add_argument("--jaw-open-one-value", type=float, default=0.15, help="Source value at or above which jawOpen output becomes 1")
     parser.add_argument("--list-devices", action="store_true", help="List detected PyTorch devices and exit")
     parser.add_argument("--ui-port", type=int, default=8000, help="UI bind port")
     parser.add_argument("--open-browser", action="store_true", help="Open browser on UI start (web UI only)")
@@ -106,6 +108,8 @@ def main() -> None:
         device=device_choice,
         jaw_open_scale=max(args.jaw_open_scale, 0.0),
         jaw_open_source_index=max(0, min(args.jaw_open_source_index, 63)),
+        jaw_open_zero_value=args.jaw_open_zero_value,
+        jaw_open_one_value=args.jaw_open_one_value,
     )
 
     server, server_thread = start_controller(args.controller_host, args.controller_port, args.log_level, engine_config)

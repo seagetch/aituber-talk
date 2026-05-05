@@ -30,6 +30,7 @@ body { background: #0f172a; }
 .session-id { font-family: "JetBrains Mono", "Consolas", monospace; color: #9ca3af; }
 .session-status { padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; background: #374151; color: #f9fafb; }
 .session-status.running { background: #1d4ed833; color: #bfdbfe; }
+.session-status.ready { background: #064e3b33; color: #a7f3d0; }
 .session-status.completed { background: #14532d33; color: #bbf7d0; }
 .session-status.stopped { background: #4c1d9533; color: #e0e7ff; }
 .session-status.error { background: #7f1d1d33; color: #fecaca; }
@@ -88,13 +89,21 @@ def send_command(controller_url: str, session_id: str, command: str) -> str:
         return data["error"]
     return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
 
-def update_settings(controller_url: str, jaw_open_scale: float, jaw_open_source_index: int) -> str:
+def update_settings(
+    controller_url: str,
+    jaw_open_scale: float,
+    jaw_open_source_index: int,
+    jaw_open_zero_value: float,
+    jaw_open_one_value: float,
+) -> str:
     data = _fetch_json(
         "PATCH",
         f"{controller_url}/settings",
         json={
             "jaw_open_scale": float(jaw_open_scale),
             "jaw_open_source_index": int(jaw_open_source_index),
+            "jaw_open_zero_value": float(jaw_open_zero_value),
+            "jaw_open_one_value": float(jaw_open_one_value),
         },
         timeout=10,
     )
@@ -102,9 +111,37 @@ def update_settings(controller_url: str, jaw_open_scale: float, jaw_open_source_
         return data["error"]
     return json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, dict) else str(data)
 
+def update_settings_and_format(
+    controller_url: str,
+    jaw_open_scale: float,
+    jaw_open_source_index: int,
+    jaw_open_zero_value: float,
+    jaw_open_one_value: float,
+) -> Tuple[str, str]:
+    result = update_settings(
+        controller_url,
+        jaw_open_scale,
+        jaw_open_source_index,
+        jaw_open_zero_value,
+        jaw_open_one_value,
+    )
+    return result, format_motion_settings(get_settings(controller_url))
+
 def get_settings(controller_url: str) -> Dict[str, Any]:
     data = _fetch_json("GET", f"{controller_url}/settings", timeout=5)
     return data if isinstance(data, dict) and "error" not in data else {}
+
+def format_motion_settings(settings: Dict[str, Any]) -> str:
+    source = settings.get("jaw_open_current_source")
+    value = settings.get("jaw_open_current_value")
+    source_text = f"{float(source):.4f}" if source is not None else "?"
+    value_text = f"{float(value):.4f}" if value is not None else "?"
+    zero = settings.get("jaw_open_zero_value", "?")
+    one = settings.get("jaw_open_one_value", "?")
+    return (
+        f"**jawOpen current:** source {source_text} -> value {value_text}  \n"
+        f"**range:** source <= {zero} => 0, source >= {one} => 1"
+    )
 
 def create_session(controller_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return _fetch_json("POST", f"{controller_url}/sessions", json=payload, timeout=30)
@@ -158,7 +195,17 @@ PRESENT_EVENT_TYPES = {
     "presentation_slide_started",
     "presentation_slide_completed",
     "presentation_image_shown",
+    "presentation_image_viewer_starting",
+    "presentation_image_viewer_ready",
+    "presentation_image_viewer_error",
     "presentation_loop_waiting",
+    "presentation_buffering_started",
+    "presentation_buffering_slide_started",
+    "presentation_buffering_slide_completed",
+    "presentation_buffering_progress",
+    "presentation_buffering_completed",
+    "presentation_buffering_error",
+    "presentation_buffered_play_started",
     "presentation_finished",
     "presentation_error",
     "presentation_stopped",
@@ -244,7 +291,12 @@ def render_present_cards(details: Dict[str, Dict[str, Any]], selected_id: Option
         slides_total = status_info.get("slides_total") or metadata.get("slides_total") or 0
         current_slide = status_info.get("current_slide") or 0
         progress_pct = 0.0
-        if slides_total:
+        buffering = status_info.get("buffering", {}) or {}
+        buffer_status = buffering.get("status") or status_info.get("buffer_status") or metadata.get("buffer_status")
+        buffer_progress = buffering.get("progress", status_info.get("buffer_progress"))
+        if buffer_progress is not None and buffer_status in {"buffering", "ready"}:
+            progress_pct = max(0.0, min(100.0, float(buffer_progress) * 100.0))
+        elif slides_total:
             progress_pct = max(0.0, min(100.0, (current_slide / slides_total) * 100.0))
         status_label = (session_info.get("status") or "running").lower()
         script_name = Path(metadata.get("script_path", "")).name if metadata.get("script_path") else "?"
@@ -258,6 +310,8 @@ def render_present_cards(details: Dict[str, Dict[str, Any]], selected_id: Option
             flags.append(f"<span class='session-flag'>Loop: {loop_count or 1}</span>")
         if status_info.get("paused"):
             flags.append("<span class='session-flag'>Paused</span>")
+        if buffering.get("enabled") or status_info.get("all_buffered") or metadata.get("all_buffered"):
+            flags.append(f"<span class='session-flag'>Buffered: {buffer_status or 'unknown'}</span>")
         queued = status_info.get("queued")
         if queued:
             flags.append(f"<span class='session-flag'>Queue: {queued}</span>")
@@ -299,6 +353,30 @@ def format_present_status(detail: Dict[str, Any]) -> str:
     slides_total = status_info.get("slides_total") or metadata.get("slides_total")
     current_slide = status_info.get("current_slide") or 0
     lines.append(f"**Slides:** {current_slide}/{slides_total or '?'}")
+    buffering = status_info.get("buffering", {}) or {}
+    if buffering.get("enabled") or status_info.get("all_buffered") or metadata.get("all_buffered"):
+        buffer_status = buffering.get("status") or status_info.get("buffer_status") or metadata.get("buffer_status") or "unknown"
+        buffer_done = buffering.get("slides_done", status_info.get("buffer_done", metadata.get("buffer_done", 0)))
+        buffer_total = buffering.get("slides_total", status_info.get("buffer_total", metadata.get("buffer_total", slides_total or 0)))
+        segments_done = buffering.get("segments_done", status_info.get("segments_done", metadata.get("segments_done", 0)))
+        segments_total = buffering.get("segments_total", status_info.get("segments_total", metadata.get("segments_total", 0)))
+        steps_done = buffering.get("generation_steps_done", status_info.get("generation_steps_done", metadata.get("generation_steps_done", 0)))
+        steps_total = buffering.get("generation_steps_total", status_info.get("generation_steps_total", metadata.get("generation_steps_total", 0)))
+        stage = buffering.get("stage") or status_info.get("generation_stage") or metadata.get("generation_stage")
+        current_segment = buffering.get("current_segment") or status_info.get("current_segment") or metadata.get("current_segment")
+        current_text = buffering.get("current_segment_text") or status_info.get("current_segment_text") or metadata.get("current_segment_text")
+        buffer_progress = float(buffering.get("progress", status_info.get("buffer_progress") or 0.0)) * 100.0
+        lines.append(
+            f"**All Buffered:** {buffer_status} "
+            f"(slides {buffer_done}/{buffer_total}, segments {segments_done}/{segments_total}, steps {steps_done}/{steps_total}, {buffer_progress:.1f}%)"
+        )
+        if buffer_status in {"ready", "completed"}:
+            lines.append("**Ready:** Press Play Buffered Presentation to start playback.")
+        if stage:
+            lines.append(f"**Buffering stage:** segment {current_segment or '?'} / {segments_total or '?'} {stage}")
+        if current_text:
+            preview = str(current_text).replace("\n", " ")
+            lines.append(f"**Buffering text:** {preview[:160]}")
     if status_info.get("loop") or metadata.get("loop"):
         loop_count = status_info.get("loop_count") or 1
         loop_delay = status_info.get("loop_delay", metadata.get("loop_delay", 0))
@@ -312,6 +390,12 @@ def format_present_status(detail: Dict[str, Any]) -> str:
     lines.append(f"**Script:** {script_name}")
     ppt_name = Path(metadata.get("ppt_path", "")).name if metadata.get("ppt_path") else "?"
     lines.append(f"**PowerPoint:** {ppt_name}")
+    current_source = status_info.get("jaw_open_current_source")
+    current_value = status_info.get("jaw_open_current_value")
+    if current_source is not None or current_value is not None:
+        source_text = f"{float(current_source):.4f}" if current_source is not None else "?"
+        value_text = f"{float(current_value):.4f}" if current_value is not None else "?"
+        lines.append(f"**jawOpen current:** source {source_text} -> value {value_text}")
     paused = status_info.get("paused")
     if paused is not None:
         lines.append(f"**Paused:** {'Yes' if paused else 'No'}")
@@ -385,6 +469,7 @@ def build_ui(
             image_viewer: str,
             loop: bool,
             loop_delay: float,
+            all_buffered: bool,
             wait_seconds: float,
             timeout_seconds: float,
             uploads_cache: Optional[List[Dict[str, Any]]],
@@ -428,6 +513,7 @@ def build_ui(
                     "image_viewer": image_viewer or "auto",
                     "loop": bool(loop),
                     "loop_delay": float(loop_delay),
+                    "all_buffered": bool(all_buffered),
                 },
             }
             if ppt_server_path:
@@ -530,6 +616,20 @@ def build_ui(
                     summary = f"slide={payload.get('slide')} image={Path(str(payload.get('image') or '')).name or '?'}"
                 elif event_name == "presentation_loop_waiting":
                     summary = f"loop={payload.get('loop')} delay={payload.get('delay')}"
+                elif event_name == "presentation_buffering_started":
+                    summary = f"slides={payload.get('slides_total')} segments={payload.get('segments_total')}"
+                elif event_name == "presentation_buffering_slide_started":
+                    summary = f"slide={payload.get('slide')} title={payload.get('title') or '?'}"
+                elif event_name == "presentation_buffering_slide_completed":
+                    summary = f"slides={payload.get('slides_done')}/{payload.get('slides_total')} segments={payload.get('segments_done')}/{payload.get('segments_total')}"
+                elif event_name == "presentation_buffering_progress":
+                    summary = f"progress={float(payload.get('progress') or 0.0) * 100.0:.1f}%"
+                elif event_name == "presentation_buffering_completed":
+                    summary = f"slides={payload.get('slides_done')}/{payload.get('slides_total')} segments={payload.get('segments_done')}/{payload.get('segments_total')}"
+                elif event_name == "presentation_buffering_error":
+                    summary = f"error={payload.get('error')}"
+                elif event_name == "presentation_buffered_play_started":
+                    summary = f"session={session_ref}"
                 elif event_name == "presentation_finished":
                     summary = f"status={payload.get('status')} slides={payload.get('slides')}"
                 elif event_name == "presentation_error":
@@ -561,7 +661,17 @@ def build_ui(
                     slide = payload.get('slide')
                     if slide is not None:
                         slide_event_tracker[session_ref] = slide
-                if event_name in {"presentation_finished", "presentation_error", "presentation_stopped", "presentation_started", "presentation_status_change"} and isinstance(payload, dict):
+                if event_name in {
+                    "presentation_finished",
+                    "presentation_error",
+                    "presentation_stopped",
+                    "presentation_started",
+                    "presentation_status_change",
+                    "presentation_buffering_started",
+                    "presentation_buffering_completed",
+                    "presentation_buffering_error",
+                    "presentation_buffered_play_started",
+                } and isinstance(payload, dict):
                     status_value = payload.get('status')
                     if status_value is None:
                         if event_name == "presentation_error":
@@ -569,6 +679,14 @@ def build_ui(
                         elif event_name == "presentation_stopped":
                             status_value = 'stopped'
                         elif event_name == "presentation_started":
+                            status_value = 'running'
+                        elif event_name == "presentation_buffering_started":
+                            status_value = 'buffering'
+                        elif event_name == "presentation_buffering_completed":
+                            status_value = 'ready'
+                        elif event_name == "presentation_buffering_error":
+                            status_value = 'error'
+                        elif event_name == "presentation_buffered_play_started":
                             status_value = 'running'
                     if status_value is not None:
                         status_event_tracker[session_ref] = status_value
@@ -621,7 +739,15 @@ def build_ui(
                 'status': status_label,
             }
 
-        def present_snapshot(selected_session: Optional[str]) -> Tuple[str, Any, str, Optional[str]]:
+        def _buffer_progress_for(detail: Optional[Dict[str, Any]]) -> float:
+            if not detail:
+                return 0.0
+            status_info = detail.get("status", {}) or {}
+            buffering = status_info.get("buffering", {}) or {}
+            progress = buffering.get("progress", status_info.get("buffer_progress") or 0.0)
+            return max(0.0, min(100.0, float(progress) * 100.0))
+
+        def present_snapshot(selected_session: Optional[str]) -> Tuple[str, Any, str, Optional[str], float]:
             sessions = list_present_sessions(controller_url)
             detail_map: Dict[str, Dict[str, Any]] = {}
             for session in sessions:
@@ -644,6 +770,7 @@ def build_ui(
                     gr.update(choices=[], value=None),
                     "No active presentation sessions.",
                     None,
+                    0.0,
                 )
             ordered_ids = sorted(
                 detail_map.keys(),
@@ -666,11 +793,50 @@ def build_ui(
                 present_selection["id"] = selected_session
             if selected_session:
                 track_progress(selected_session, detail_map[selected_session])
-            return cards_html, dropdown, status_text, selected_session
+            return cards_html, dropdown, status_text, selected_session, _buffer_progress_for(detail_map.get(selected_session))
 
         def refresh_present(selected_session: Optional[str]):
-            cards_html, dropdown, status_text, selected_session = present_snapshot(selected_session)
-            return cards_html, dropdown, status_text, get_event_log_text(), selected_session
+            cards_html, dropdown, status_text, selected_session, buffer_progress = present_snapshot(selected_session)
+            return cards_html, dropdown, status_text, get_event_log_text(), selected_session, buffer_progress
+
+        def format_buffering_event_status(payload: Dict[str, Any]) -> str:
+            progress = float(payload.get("progress") or 0.0) * 100.0
+            text = str(payload.get("text") or "").replace("\n", " ")
+            lines = [
+                f"**Session:** {payload.get('session', '?')} (buffering)",
+                f"**Slides:** {payload.get('slide', '?')}/{payload.get('slides_total', '?')}",
+                (
+                    f"**All Buffered:** buffering "
+                    f"(segments {payload.get('segments_done', 0)}/{payload.get('segments_total', '?')}, "
+                    f"steps {payload.get('generation_steps_done', 0)}/{payload.get('generation_steps_total', '?')}, "
+                    f"{progress:.1f}%)"
+                ),
+                f"**Slide title:** {payload.get('title') or '?'}",
+                (
+                    f"**Buffering stage:** segment {payload.get('current_segment', '?')} / "
+                    f"{payload.get('segments_total', '?')} {payload.get('stage') or '?'}"
+                ),
+            ]
+            if text:
+                lines.append(f"**Buffering text:** {text[:160]}")
+            return "\n".join(lines)
+
+        def format_buffering_completed_status(payload: Dict[str, Any]) -> str:
+            lines = [
+                f"**Session:** {payload.get('session', '?')} (ready)",
+                f"**Slides:** {payload.get('slides_done', payload.get('slides_total', '?'))}/{payload.get('slides_total', '?')}",
+                (
+                    f"**All Buffered:** ready "
+                    f"(segments {payload.get('segments_done', '?')}/{payload.get('segments_total', '?')}, "
+                    f"steps {payload.get('generation_steps_done', '?')}/{payload.get('generation_steps_total', '?')}, "
+                    "100.0%)"
+                ),
+                "**Ready:** Press Play Buffered Presentation to start playback.",
+            ]
+            duration = payload.get("duration")
+            if duration is not None:
+                lines.append(f"**Buffered audio duration:** {float(duration):.1f}s")
+            return "\n".join(lines)
 
         def refresh_sessions_json() -> str:
             sessions = list_sessions(controller_url)
@@ -678,8 +844,8 @@ def build_ui(
 
         def watch_present_sessions(initial_selection: Optional[str]):
             selected = initial_selection
-            cards_html, dropdown, status_text, selected = present_snapshot(selected)
-            yield cards_html, dropdown, status_text, get_event_log_text(), selected
+            cards_html, dropdown, status_text, selected, buffer_progress = present_snapshot(selected)
+            yield cards_html, dropdown, status_text, get_event_log_text(), selected, buffer_progress
 
             events_q: Queue[Tuple[str, Dict[str, Any]]] = Queue()
             stop_event = threading.Event()
@@ -729,8 +895,24 @@ def build_ui(
                         append_log(log_name, log_payload)
                     with selection_lock:
                         selected = present_selection["id"]
-                    cards_html, dropdown, status_text, selected = present_snapshot(selected)
-                    yield cards_html, dropdown, status_text, get_event_log_text(), selected
+                    if (
+                        event_name == "presentation_buffering_progress"
+                        and isinstance(payload, dict)
+                        and payload.get("session") == selected
+                    ):
+                        status_text = format_buffering_event_status(payload)
+                        buffer_progress = max(0.0, min(100.0, float(payload.get("progress") or 0.0) * 100.0))
+                    elif (
+                        event_name == "presentation_buffering_completed"
+                        and isinstance(payload, dict)
+                        and payload.get("session") == selected
+                    ):
+                        cards_html, dropdown, _, selected, _ = present_snapshot(selected)
+                        status_text = format_buffering_completed_status(payload)
+                        buffer_progress = 100.0
+                    else:
+                        cards_html, dropdown, status_text, selected, buffer_progress = present_snapshot(selected)
+                    yield cards_html, dropdown, status_text, get_event_log_text(), selected, buffer_progress
                     last_emit = time.monotonic()
             finally:
                 stop_event.set()
@@ -781,8 +963,17 @@ def build_ui(
                     value=int(settings.get("jaw_open_source_index", 35)),
                     precision=0,
                 )
+                jaw_open_zero_value = gr.Number(
+                    label="source <= this gives jawOpen 0",
+                    value=float(settings.get("jaw_open_zero_value", 0.0)),
+                )
+                jaw_open_one_value = gr.Number(
+                    label="source >= this gives jawOpen 1",
+                    value=float(settings.get("jaw_open_one_value", 0.15)),
+                )
                 apply_settings_button = gr.Button("Apply motion settings", variant="secondary")
                 motion_settings_result = gr.Textbox(label="Motion Settings Result", interactive=False)
+                motion_settings_current = gr.Markdown(format_motion_settings(settings))
                 speaker_dropdown.change(
                     lambda name: gr.update(
                         choices=(choices := style_choices(name)),
@@ -792,9 +983,27 @@ def build_ui(
                     outputs=[style_dropdown],
                 )
                 apply_settings_button.click(
-                    lambda scale, source_index: update_settings(controller_url, scale, source_index),
-                    inputs=[jaw_open_scale, jaw_open_source_index],
-                    outputs=motion_settings_result,
+                    lambda scale, source_index, zero_value, one_value: update_settings_and_format(
+                        controller_url,
+                        scale,
+                        source_index,
+                        zero_value,
+                        one_value,
+                    ),
+                    inputs=[
+                        jaw_open_scale,
+                        jaw_open_source_index,
+                        jaw_open_zero_value,
+                        jaw_open_one_value,
+                    ],
+                    outputs=[motion_settings_result, motion_settings_current],
+                )
+                motion_settings_timer = gr.Timer(value=1.0)
+                motion_settings_timer.tick(
+                    lambda: format_motion_settings(get_settings(controller_url)),
+                    outputs=motion_settings_current,
+                    queue=False,
+                    show_progress="hidden",
                 )
 
             with gr.Tabs():
@@ -836,6 +1045,7 @@ def build_ui(
                     wait_slider = gr.Slider(label="Slide delay (seconds)", minimum=0.0, maximum=5.0, value=1.0, step=0.1)
                     loop_checkbox = gr.Checkbox(label="Loop presentation", value=False)
                     loop_delay_slider = gr.Slider(label="Loop delay (seconds)", minimum=0.0, maximum=300.0, value=0.0, step=1.0)
+                    all_buffered_checkbox = gr.Checkbox(label="All Buffered Mode", value=False)
                     timeout_slider = gr.Slider(label="Slide timeout (seconds)", minimum=30.0, maximum=600.0, value=300.0, step=10.0)
                     present_button = gr.Button("Start Presentation")
                     present_result = gr.Textbox(label="Result", interactive=False)
@@ -843,7 +1053,20 @@ def build_ui(
                     present_cards = gr.HTML("<div class='session-empty'>No active presentation sessions.</div>")
                     present_session_dropdown = gr.Dropdown(label="Session", choices=[], value=None)
                     present_status = gr.Markdown("No active presentation sessions.")
+                    buffer_progress = gr.Slider(
+                        label="All Buffered Progress",
+                        minimum=0.0,
+                        maximum=100.0,
+                        value=0.0,
+                        step=1.0,
+                        interactive=False,
+                    )
                     present_event_log = gr.Textbox(label="Event Stream", lines=8, interactive=False)
+                    all_buffered_checkbox.change(
+                        lambda enabled: gr.update(value="Prepare Presentation" if enabled else "Start Presentation"),
+                        inputs=[all_buffered_checkbox],
+                        outputs=[present_button],
+                    )
 
                     present_button.click(
                         submit_present,
@@ -856,6 +1079,7 @@ def build_ui(
                             image_viewer_mode,
                             loop_checkbox,
                             loop_delay_slider,
+                            all_buffered_checkbox,
                             wait_slider,
                             timeout_slider,
                             uploads_state,
@@ -864,7 +1088,14 @@ def build_ui(
                     ).then(
                         refresh_present,
                         inputs=[present_selected_state],
-                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                        outputs=[
+                            present_cards,
+                            present_session_dropdown,
+                            present_status,
+                            present_event_log,
+                            present_selected_state,
+                            buffer_progress,
+                        ],
                     ).then(
                         refresh_upload_components,
                         inputs=[script_existing_dropdown, ppt_existing_dropdown],
@@ -874,14 +1105,28 @@ def build_ui(
                     present_session_dropdown.change(
                         refresh_present,
                         inputs=[present_session_dropdown],
-                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                        outputs=[
+                            present_cards,
+                            present_session_dropdown,
+                            present_status,
+                            present_event_log,
+                            present_selected_state,
+                            buffer_progress,
+                        ],
                     )
 
                     refresh_timer = gr.Timer(value=2.0)
                     refresh_timer.tick(
                         refresh_present,
                         inputs=[present_selected_state],
-                        outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+                        outputs=[
+                            present_cards,
+                            present_session_dropdown,
+                            present_status,
+                            present_event_log,
+                            present_selected_state,
+                            buffer_progress,
+                        ],
                         queue=False,
                         show_progress='hidden',
                         trigger_mode='always_last',
@@ -913,10 +1158,27 @@ def build_ui(
                     )
 
                     with gr.Row():
+                        play_btn = gr.Button("Play Buffered Presentation")
                         pause_btn = gr.Button("Pause")
                         resume_btn = gr.Button("Resume")
                         stop_btn = gr.Button("Stop")
                     command_feedback = gr.Textbox(label="Command Result", interactive=False)
+                    play_btn.click(
+                        lambda session_id: send_command(controller_url, session_id, "play"),
+                        inputs=[present_session_dropdown],
+                        outputs=command_feedback,
+                    ).then(
+                        refresh_present,
+                        inputs=[present_session_dropdown],
+                        outputs=[
+                            present_cards,
+                            present_session_dropdown,
+                            present_status,
+                            present_event_log,
+                            present_selected_state,
+                            buffer_progress,
+                        ],
+                    )
                     pause_btn.click(
                         lambda session_id: send_command(controller_url, session_id, "pause"),
                         inputs=[present_session_dropdown],
@@ -997,7 +1259,14 @@ def build_ui(
         demo.load(
             watch_present_sessions,
             inputs=[present_selected_state],
-            outputs=[present_cards, present_session_dropdown, present_status, present_event_log, present_selected_state],
+            outputs=[
+                present_cards,
+                present_session_dropdown,
+                present_status,
+                present_event_log,
+                present_selected_state,
+                buffer_progress,
+            ],
             queue=False,
         )
 

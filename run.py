@@ -89,6 +89,8 @@ def build_engine_from_args(args: argparse.Namespace) -> TalkEngine:
         osc_port=args.osc_port,
         jaw_open_scale=args.jaw_open_scale,
         jaw_open_source_index=args.jaw_open_source_index,
+        jaw_open_zero_value=args.jaw_open_zero_value,
+        jaw_open_one_value=args.jaw_open_one_value,
     )
     return TalkEngine(config)
 
@@ -105,6 +107,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--osc_port", type=int, default=defaults.osc_port)
     parser.add_argument("--jaw-open-scale", type=float, default=defaults.jaw_open_scale)
     parser.add_argument("--jaw-open-source-index", type=int, default=defaults.jaw_open_source_index)
+    parser.add_argument("--jaw-open-zero-value", type=float, default=defaults.jaw_open_zero_value)
+    parser.add_argument("--jaw-open-one-value", type=float, default=defaults.jaw_open_one_value)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=34512)
     return parser.parse_args(argv)
